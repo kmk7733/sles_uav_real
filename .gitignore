@@ -1,0 +1,20 @@
+# --- third-party packages: each has its own .git and upstream remote ---
+openmv_cam/
+vicon_bridge/
+vrpn_client_ros/
+zed-ros-examples/
+zed-ros-wrapper/
+
+# catkin toplevel symlink into /opt/ros
+CMakeLists.txt
+
+# build / runtime artifacts
+__pycache__/
+*.pyc
+*.bag
+*.pth
+*.ulg
+*.png
+
+# Claude Code per-machine settings
+.claude/settings.local.json

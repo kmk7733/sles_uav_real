@@ -1,0 +1,62 @@
+<launch>
+  <!-- MPC (MPPI) trajectory node — stage 1: visualize planned trajectory in Foxglove.
+       Publishes /mpc/trajectory (nav_msgs/Path) in the grid frame (usually `map`).
+       Set a goal by publishing geometry_msgs/PoseStamped on /move_base_simple/goal
+       (Foxglove/RViz "2D Goal Pose"). -->
+
+  <arg name="grid_topic"  default="/grid_map"/>
+  <!-- pose MUST be in the same frame as the grid. /robot/pose_world is the
+       localization pose bridged into the grid's world frame by pose_to_world
+       (zed_vicon_grid.launch). Raw sources (/rogx2/zed2i/zed_node/pose in
+       'map', /mavros/local_position/pose in FCU ENU) are NOT in that frame. -->
+  <arg name="pose_topic"  default="/robot/pose_world"/>
+  <arg name="goal_topic"  default="/move_base_simple/goal"/>
+  <arg name="z_hold"      default="1.0"/>
+  <!-- default goal: plan toward this immediately; publishing goal_topic overrides it -->
+  <arg name="use_default_goal" default="true"/>
+  <arg name="goal_x"      default="2.5"/>
+  <arg name="goal_y"      default="0.0"/>
+
+  <node pkg="mpc_controller" type="mpc_node.py" name="mpc_node" output="screen">
+    <param name="grid_topic" value="$(arg grid_topic)"/>
+    <param name="pose_topic" value="$(arg pose_topic)"/>
+    <param name="goal_topic" value="$(arg goal_topic)"/>
+    <param name="z_hold"     value="$(arg z_hold)"/>
+    <param name="use_default_goal" value="$(arg use_default_goal)"/>
+    <param name="goal_x"     value="$(arg goal_x)"/>
+    <param name="goal_y"     value="$(arg goal_y)"/>
+
+    <!-- planner (tune as needed) -->
+    <param name="horizon"       value="30"/>
+    <param name="num_rollouts"  value="256"/>
+    <param name="mppi_iters"    value="1"/>
+    <param name="ctg_period"    value="0.5"/>   <!-- cost-to-go refresh interval [s] -->
+    <param name="mppi_dt"       value="0.1"/>
+    <param name="plan_rate"     value="10.0"/>
+    <param name="robot_radius"  value="0.31"/>
+    <param name="robot_clear_radius" value="0.30"/>  <!-- clear robot footprint -->
+    <param name="v_cap"         value="0.8"/>
+    <param name="a_max"         value="0.7"/>
+    <param name="use_cost_to_go" value="true"/>
+    <!-- unknown (gray) cells are obstacles: rollouts stay inside OBSERVED free
+         space. Works together with the grid's near_free seeding (r=0.5 around
+         the robot) so there is always free space to plan in at startup. -->
+    <param name="unknown_is_obstacle" value="true"/>
+
+    <!-- anti-chatter: keep left/right avoidance choice stable across replans
+         and never publish an infeasible softmax-mean trajectory -->
+    <param name="sigma"            value="0.7"/>
+    <param name="temperature"      value="0.3"/>   <!-- relative units (cost_norm): rollouts within ~0.3 std of best mix -->
+    <param name="noise_beta"       value="0.8"/>
+    <param name="near_obs_w"       value="3.0"/>
+    <param name="cost_norm"        value="true"/>
+    <param name="consistency_w"    value="200.0"/> <!-- control-space hysteresis; 0 = legacy, tune 50-500 -->
+    <param name="path_consistency_w" value="100.0"/> <!-- PATH hysteresis (the decisive side-lock): offline 0-1 flips/200 vs 20-27 legacy, re-route 0.2-0.3s when the side truly blocks. 300 = even stickier (0 flips, 0.3-0.5s re-route) -->
+    <param name="smoothing_w"      value="1.0"/>   <!-- within-horizon control-rate penalty -->
+    <param name="revalidate_mean"  value="true"/>  <!-- collision-check the averaged plan, fall back to best rollout -->
+    <param name="retry_keep_warm"  value="true"/>  <!-- first recovery keeps warm start (no random side re-seed) -->
+    <param name="near_obs_soft"    value="true"/>  <!-- smooth EDT proximity cost instead of binary -->
+    <param name="near_obs_falloff" value="0.30"/>
+    <param name="vel_ema_alpha"    value="0.3"/>
+  </node>
+</launch>

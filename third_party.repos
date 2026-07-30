@@ -1,0 +1,28 @@
+# Third-party ROS packages this workspace needs, pinned to the commits the
+# vehicle is actually flying. They are NOT vendored into this repo.
+#
+#   vcs import . < third_party.repos      (from ~/catkin_ws/src)
+#
+# Some of them carry LOCAL MODIFICATIONS that are essential and are not in
+# upstream. After importing, run:  ./overlays/sync.sh restore
+repositories:
+  openmv_cam:
+    type: git
+    url: https://gitlab.com/ant-x/tools/openmv_cam.git
+    version: 092c4fb9230ab781b1da52cc74d1d95a7efbddb5
+  vicon_bridge:
+    type: git
+    url: https://github.com/ethz-asl/vicon_bridge.git
+    version: 450494a6204468453520b37d249a454f2e35bd86
+  vrpn_client_ros:
+    type: git
+    url: https://gitlab.com/ant-x/tools/vrpn_client_ros.git
+    version: f48d15809daa541415c1d35402c79c59198c0ff1
+  zed-ros-examples:
+    type: git
+    url: https://github.com/stereolabs/zed-ros-examples.git
+    version: 79c37a8f9f1f9ee581ff17d9837df29571c86208
+  zed-ros-wrapper:
+    type: git
+    url: https://github.com/stereolabs/zed-ros-wrapper.git
+    version: c37f65dfec547d6739d94c6109c3eb3fc7fecbeb

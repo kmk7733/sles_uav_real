@@ -1,0 +1,103 @@
+# =============================================================================
+# Drone flight data-collection configuration (DeSimplex HPA planner dataset)
+# =============================================================================
+# The imitation-learning (HPA) planner we want to train maps the onboard
+# perception (stereo RGB + depth) to a short future trajectory expressed as
+# waypoints (x, y, z, yaw / heading). This file defines:
+#   1. which ROS topics to record into a rosbag during a human-piloted flight
+#   2. how the offline extractor turns a bag into a synchronized training set
+#
+# Everything is namespaced under `drone_ns` so the same config works if the
+# vehicle name ever changes from "rogx2" to something else.
+# =============================================================================
+
+drone_ns: "rogx2"          # ROS namespace prefix of the vehicle (no leading /)
+
+# Where sessions are written. Each recording creates a timestamped subfolder.
+output_dir: "~/drone_data"
+
+# -----------------------------------------------------------------------------
+# STATE topics -- post-processed offline into the planner output labels
+# (x, y, z, heading) plus velocities. We record several redundant sources so
+# you can choose the most reliable one after the flight.
+# -----------------------------------------------------------------------------
+# label_source selects where the extractor gets the (x,y,z,yaw) pose label:
+#   "mavros_odom" -> {ns}/mavros/local_position/odom      (EKF2 fused, ENU)
+#   "zed_odom"    -> {ns}/zed2i/zed_node/odom             (ZED visual-inertial)
+#   "tf"          -> the transform tf_label.parent -> tf_label.child on /tf
+label_source: "mavros_odom"
+
+# Used only when label_source == "tf" (e.g. the rogx_vision_mockup bags, where
+# pose is published as odom -> base_link on /tf instead of an Odometry topic).
+tf_label:
+  parent_frame: "odom"
+  child_frame: "base_link"
+
+# Optional velocity source when label_source == "tf" (the odom sources already
+# carry their own twist). Nearest-matched to each pose; set to "" to store zeros.
+velocity_topic: "{ns}/mavros/local_position/velocity_body"
+
+state_topics:
+  - "{ns}/mavros/local_position/odom"          # nav_msgs/Odometry  (pose + twist) PRIMARY
+  - "{ns}/mavros/local_position/pose"          # geometry_msgs/PoseStamped
+  - "{ns}/mavros/local_position/velocity_local"# geometry_msgs/TwistStamped
+  - "{ns}/mavros/local_position/velocity_body" # geometry_msgs/TwistStamped
+  - "{ns}/mavros/imu/data"                     # sensor_msgs/Imu    (orientation/rates)
+  - "{ns}/mavros/altitude"                     # mavros_msgs/Altitude
+  - "{ns}/mavros/state"                        # mavros_msgs/State  (mode/armed -> flight segmentation)
+  - "{ns}/zed2i/zed_node/odom"                 # nav_msgs/Odometry  (ZED VIO, alt. label source)
+  - "{ns}/zed2i/zed_node/pose"                 # geometry_msgs/PoseStamped
+
+# Optional: the human RC stick input. NOT used as the label (labels come from
+# state), but handy for flagging which segments were truly human-piloted.
+# Comment out if you do not want it.
+rc_topics:
+  - "{ns}/mavros/rc/in"                        # mavros_msgs/RCIn
+  - "{ns}/mavros/manual_control/control"       # mavros_msgs/ManualControl
+
+# -----------------------------------------------------------------------------
+# SENSOR topics -- the training INPUTS (stereo RGB + depth) + intrinsics
+# -----------------------------------------------------------------------------
+# RGB is recorded compressed (JPEG) to keep bag size / disk bandwidth sane on
+# the remote machine. Depth is recorded RAW (32FC1, metres) because compressed
+# depth is lossy and awkward to decode. Flip these in `sensor_topics` if your
+# disk/CPU budget differs.
+sensor_topics:
+  # ---- stereo RGB (rectified) ----
+  - "{ns}/zed2i/zed_node/left/image_rect_color/compressed"    # sensor_msgs/CompressedImage
+  - "{ns}/zed2i/zed_node/right/image_rect_color/compressed"   # sensor_msgs/CompressedImage
+  # ---- depth (registered to left camera, metres) ----
+  - "{ns}/zed2i/zed_node/depth/depth_registered"              # sensor_msgs/Image 32FC1
+  # ---- camera intrinsics (low rate, recorded raw) ----
+  - "{ns}/zed2i/zed_node/left/camera_info"                    # sensor_msgs/CameraInfo
+  - "{ns}/zed2i/zed_node/right/camera_info"                   # sensor_msgs/CameraInfo
+  - "{ns}/zed2i/zed_node/depth/camera_info"                   # sensor_msgs/CameraInfo
+
+# Coordinate frames -- useful if you later want to transform between the
+# mavros (FCU/ENU) frame and the ZED camera/odom frame.
+tf_topics:
+  - "/tf"
+  - "/tf_static"
+
+# -----------------------------------------------------------------------------
+# rosbag record options (used by record_flight.py)
+# -----------------------------------------------------------------------------
+rosbag:
+  compression: "lz4"     # "lz4" (fast, low CPU -- recommended on the drone PC),
+                         # "bz2" (smaller, high CPU), or "none"
+  split_size_mb: 2048    # start a new bag chunk every N MB (0 = single file)
+  buffer_size_mb: 1024   # rosbag internal buffer; raise if you see "buffer exceeded"
+
+# -----------------------------------------------------------------------------
+# Extraction / synchronization options (used by extract_flight_dataset.py)
+# -----------------------------------------------------------------------------
+extraction:
+  reference_topic: "{ns}/zed2i/zed_node/left/image_rect_color/compressed"
+  sample_hz: 10.0        # resample the flight to this rate (<= camera fps)
+  sync_slop_s: 0.05      # max |dt| between the reference frame and a matched msg
+  save_depth_as: "npy"   # "npy" (float32 metres, lossless) or "png16" (mm, uint16)
+  # Future-trajectory label horizon: for each sample, the extractor also stores
+  # the next `horizon_len` poses spaced `horizon_dt` apart -- this is the actual
+  # planner OUTPUT (a short (x,y,z,yaw) trajectory), not just the current pose.
+  horizon_len: 20        # number of future waypoints per sample (0 = current pose only)
+  horizon_dt: 0.1        # seconds between future waypoints

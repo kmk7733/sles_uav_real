@@ -1,0 +1,13 @@
+diff --git a/launch/vicon.launch b/launch/vicon.launch
+index 7adbeee..a0d3857 100644
+--- a/launch/vicon.launch
++++ b/launch/vicon.launch
+@@ -3,7 +3,7 @@
+ <launch>
+ 
+   <!-- IP and port on Vicon Windows PC -->
+-  <arg name="datastream_hostport" default="192.168.94.81:801"/>
++  <arg name="datastream_hostport" default="192.17.163.14"/>
+   <!-- Fixed vicon world frame -->
+   <arg name="vicon_world_frame" default="/vicon/world"/>
+ 
