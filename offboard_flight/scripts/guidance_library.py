@@ -71,6 +71,39 @@ class Controller():
 
         return target_raw_pose
 
+    def construct_target_full(self, p, v, a, yaw, yaw_rate):
+        ''' Full position + velocity + acceleration + yaw + yaw-rate setpoint.
+
+        construct_target() above sends position and yaw only, masking off
+        everything else. That throws away most of what a trajectory planner
+        produces: PX4 then has to rediscover the intended velocity by
+        differentiating a sequence of position steps, which is exactly the lag
+        the feedforward terms exist to remove.
+
+        This variant masks nothing (type_mask = 0), so PX4 takes the position as
+        the setpoint and the velocity and acceleration as feedforward. FORCE is
+        deliberately NOT set -- the acceleration field is an acceleration, not a
+        force.
+
+        p, v, a are length-3 sequences in the FCU local ENU frame.
+        '''
+
+        t = PositionTarget()
+        t.header.stamp = rospy.Time.now()
+        t.coordinate_frame = 1                    # FRAME_LOCAL_NED (ENU in mavros)
+
+        t.position.x, t.position.y, t.position.z = float(p[0]), float(p[1]), float(p[2])
+        t.velocity.x, t.velocity.y, t.velocity.z = float(v[0]), float(v[1]), float(v[2])
+        t.acceleration_or_force.x = float(a[0])
+        t.acceleration_or_force.y = float(a[1])
+        t.acceleration_or_force.z = float(a[2])
+
+        t.type_mask = 0
+        t.yaw = float(yaw)
+        t.yaw_rate = float(yaw_rate)
+
+        return t
+
     def construct_target_velocity(self, vx, vy, vz, yaw):
 
         target_raw_vel = PositionTarget()

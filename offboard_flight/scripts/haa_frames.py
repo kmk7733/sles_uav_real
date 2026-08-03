@@ -118,6 +118,18 @@ class WorldToFcu(object):
             return p
         return p, wrap_pi(yaw_world + self.dyaw)
 
+    def rotate_to_fcu(self, v_world):
+        """Rotate a FREE vector (velocity, acceleration) into the FCU frame.
+
+        Velocities and accelerations are differences of positions, so the
+        translation cancels and only the yaw rotation applies. Passing them
+        through to_fcu() instead would add the offset t and turn a 1 m/s
+        velocity reference into a nonsense several-metres-per-second one.
+        """
+        if not self.ready:
+            raise RuntimeError("world->FCU transform not established yet")
+        return self._rz(self.dyaw).dot(np.asarray(v_world, dtype=np.float64))
+
     def to_world(self, p_fcu, yaw_fcu=None):
         """Inverse map, for sanity checks and logging."""
         if not self.ready:
