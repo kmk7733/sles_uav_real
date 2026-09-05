@@ -150,7 +150,13 @@ class PlanarPlannerNode(object):
         self.occ_thresh = int(rospy.get_param("~occ_thresh", 50))
         self.clear_footprint = rospy.get_param("~clear_footprint", True)
 
-        self.goal = np.array([rospy.get_param("~goal_x", 2.5),
+        # DEFAULT GOAL (2.0, 0.0), and it has to sit clear of the map edge.
+        # The grid is x [-4.0, 3.0] grown outward by a 0.1 m always-occupied
+        # border ring, so x = 3.0 is ON the wall and x = 2.5 is 0.5 m from it
+        # -- inside r_safe (0.51 m), which the validator would refuse. 2.0
+        # leaves a metre of standoff, and the vehicle starts near x = -2.9, so
+        # it is still a ~4.9 m traverse.
+        self.goal = np.array([rospy.get_param("~goal_x", 2.0),
                               rospy.get_param("~goal_y", 0.0)])
 
         self.plan_timeout = rospy.get_param("~plan_timeout", 0.5)
