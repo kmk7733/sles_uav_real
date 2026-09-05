@@ -47,6 +47,10 @@ state_topics:
   - "{ns}/mavros/state"                        # mavros_msgs/State  (mode/armed -> flight segmentation)
   - "{ns}/zed2i/zed_node/odom"                 # nav_msgs/Odometry  (ZED VIO, alt. label source)
   - "{ns}/zed2i/zed_node/pose"                 # geometry_msgs/PoseStamped
+  # ---- Vicon ground truth (absolute topic: vicon_bridge is NOT namespaced) ----
+  # Needed to fit world_T_odom offline (mocap_frame_align.py). Without this the
+  # bag has no mocap reference and the frame conversion cannot be recovered.
+  - "/vicon/ROGX2/ROGX2"                       # geometry_msgs/TransformStamped
 
 # Optional: the human RC stick input. NOT used as the label (labels come from
 # state), but handy for flagging which segments were truly human-piloted.

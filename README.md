@@ -13,6 +13,7 @@ This repository holds the packages we wrote. It is checked out **as**
 | `mpc_controller/` | earlier MPPI/planner experiments |
 | `data_collection/` | flight data collection |
 | `overlays/` | files that live inside third-party repos — see below |
+| `perception/` | Andert's inverse sensor model, **byte-identical** to the simulator's `planar_sim/perception/`. Not third-party and not an overlay: it is tracked here directly. See `perception/VENDOR.md` — do not edit those two files on this machine |
 
 ## Third-party packages are NOT in this repo
 
@@ -38,11 +39,12 @@ What is in there, and why it matters:
 
 | File | Role |
 |---|---|
-| `scripts/depth_to_grid.py` | point cloud → `/grid_map` — the entire mapping stage |
+| `scripts/depth_to_grid.py` | point cloud → `/grid_map` — the original mapping stage, and what has flown |
+| `scripts/depth_to_grid_andert.py` | depth image → `/grid_map` by Andert IROS 2009, around the simulator's own `perception/` package. Selected with `mapper:=andert`; `mapper:=both` runs the two on separate topics for an A/B |
 | `scripts/vicon_map_align.py` | broadcasts `vicon/world → map` |
 | `scripts/pose_to_world.py` | publishes `/robot/pose_world`, the planner's state source |
 | `launch/zed_vicon_grid.launch` | mapping stack, vicon-aligned |
-| `launch/zed_depth_grid.launch` | `depth_to_grid` alone — used for rosbag replay |
+| `launch/zed_depth_grid.launch` | the mapper node(s) alone — used for rosbag replay. `mapper:=pointcloud\|andert\|both` |
 
 Without these the vehicle has no map and the planner has no state. They were
 untracked inside a third-party checkout, i.e. one `git clean` from being lost,
