@@ -80,7 +80,7 @@ class PlanarOccupancy(object):
     """Binary unsafe-set over a 2D grid, with a cached distance transform."""
 
     def __init__(self, unsafe, resolution, origin=(0.0, 0.0), frame_id="map",
-                 edt_margin=None):
+                 edt_margin=None, occupied=None, unknown=None):
         """
         unsafe      (H, W) bool. True = occupied, unknown, or otherwise not
                     flyable. Row 0 is the origin row, matching
@@ -90,6 +90,22 @@ class PlanarOccupancy(object):
         edt_margin  metres subtracted from every clearance reading to absorb the
                     cell-centre-to-cell-centre bias of the distance transform.
                     Defaults to res/2. See the module docstring.
+        occupied    (H, W) bool, MEASURED obstacles only.
+        unknown     (H, W) bool, cells the sensor has not resolved.
+
+        WHY THE COMPONENTS ARE KEPT SEPARATELY
+        `unsafe` remains the authoritative gate and its meaning is unchanged --
+        the validator, the EDT and clearance() all still read it and nothing
+        about them moves. But `unsafe` has already thrown away the distinction
+        between "there is a wall here" and "nobody has looked here", and the
+        geodesic cost-to-go needs exactly that distinction: it treats unknown
+        as PASSABLE so the vehicle is willing to head toward a gap it cannot
+        yet see through, while the validator keeps refusing to actually enter
+        unknown space. Reconstructing the split from `unsafe` is impossible, so
+        it is retained here.
+
+        Both default to the single-set view (occupied = unsafe, nothing
+        unknown), which is what every existing caller already assumes.
         """
         self.unsafe = np.ascontiguousarray(unsafe, dtype=bool)
         if self.unsafe.ndim != 2:
@@ -102,6 +118,11 @@ class PlanarOccupancy(object):
         self.H, self.W = self.unsafe.shape
         self._edt = None
 
+        self.occupied = (self.unsafe.copy() if occupied is None
+                         else np.ascontiguousarray(occupied, dtype=bool))
+        self.unknown = (np.zeros_like(self.unsafe) if unknown is None
+                        else np.ascontiguousarray(unknown, dtype=bool))
+
     # ------------------------------------------------------------- builders
 
     @classmethod
@@ -110,10 +131,13 @@ class PlanarOccupancy(object):
                     **kw):
         """Build from raw OccupancyGrid cell values (0..100, -1 unknown)."""
         v = np.asarray(values, dtype=np.int16)
-        unsafe = v >= int(occ_thresh)
+        occupied = v >= int(occ_thresh)
+        unknown = v < 0
+        unsafe = occupied.copy()
         if unknown_unsafe:
-            unsafe |= (v < 0)
-        return cls(unsafe, resolution, origin, frame_id=frame_id, **kw)
+            unsafe |= unknown
+        return cls(unsafe, resolution, origin, frame_id=frame_id,
+                   occupied=occupied, unknown=unknown, **kw)
 
     @classmethod
     def from_occupancy_grid_msg(cls, msg, occ_thresh=50, unknown_unsafe=True,
@@ -208,9 +232,12 @@ class PlanarOccupancy(object):
         ys, xs = np.mgrid[y0:y1, x0:x1]
         wx, wy = self.cell_to_world(xs, ys)
         mask = (wx - cx) ** 2 + (wy - cy) ** 2 <= radius * radius
-        block = self.unsafe[y0:y1, x0:x1]
-        block[mask] = False
-        self.unsafe[y0:y1, x0:x1] = block
+        # All three views must agree, or the footprint stays unknown in the
+        # geodesic field while being free to the validator.
+        for arr in (self.unsafe, self.occupied, self.unknown):
+            block = arr[y0:y1, x0:x1]
+            block[mask] = False
+            arr[y0:y1, x0:x1] = block
         self._edt = None                             # cache is now wrong
 
     # ------------------------------------------------------------- reporting

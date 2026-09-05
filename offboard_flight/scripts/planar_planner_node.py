@@ -39,24 +39,56 @@ reference published here has vz = az = 0: altitude is held by the low-level
 controller and was never a planning variable.
 """
 
+import os
+import sys
 import threading
 
 import numpy as np
 import rospy
+from scipy.ndimage import distance_transform_edt
 
 from geometry_msgs.msg import PoseStamped, TwistStamped, Point
 from mavros_msgs.msg import PositionTarget
 from nav_msgs.msg import OccupancyGrid, Path
-from std_msgs.msg import String
+from std_msgs.msg import String, Bool
 from visualization_msgs.msg import Marker, MarkerArray
 
 from guidance_library import Controller
 from haa_frames import WorldToFcu, yaw_from_quat
-from planar_types import PlanarState, PlannerStatus
-from planar_dynamics import PlanarDynamics, PlanarLimits
-from planar_map import PlanarOccupancy, FreeSpace
-from planar_safety import PlanarSafetyValidator, safe_radius
-from planar_mppi import PlanarMPPI, PlanarCostWeights
+
+# THE PLANNER COMES FROM `planner/`, WHICH IS THE SIMULATOR'S OWN PACKAGE.
+# `catkin_ws/src/planner` is byte-identical to `planner/` in
+# sles_uav_planar_sim -- verified with `diff -rq` -- so what flies here is what
+# the simulator's tests pin and what its results were produced with. This node
+# used to import flat copies sitting beside it (planar_mppi.py, planar_map.py,
+# frontier.py, ...) that had drifted a month behind: 142 changed lines in the
+# occupancy grid alone and 180 in the frontier cost. Those files are left in
+# place but nothing imports them any more.
+#
+# Found by walking up rather than by a fixed path, so the tree can move.
+def _find_src(start):
+    d = os.path.dirname(os.path.abspath(start))
+    for _ in range(8):
+        if os.path.isfile(os.path.join(d, "planner", "__init__.py")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    raise ImportError("cannot find planner/ above %s" % start)
+
+
+_SRC = _find_src(__file__)
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+
+from planner.types import PlanarState, PlannerStatus
+from planner.dynamics import PlanarDynamics, PlanarLimits
+from planner.grid import PlanarOccupancy, FreeSpace
+from planner.safety import PlanarSafetyValidator, safe_radius
+from planner.mppi import PlanarMPPI, PlanarCostWeights
+from planner.haa.capped import CappedDynamics
+from planner.haa.cost import FrontierMPPI
 
 
 class PlanarPlannerNode(object):
@@ -97,7 +129,7 @@ class PlanarPlannerNode(object):
         # under piecewise-constant acceleration -- but it wrecks the valid
         # fraction fastest, so it is the wrong lever here.
         self.horizon = int(rospy.get_param("~horizon", 20))
-        self.num_samples = int(rospy.get_param("~num_samples", 128))
+        self.num_samples = int(rospy.get_param("~num_samples", 192))
 
         self.r_quad = rospy.get_param("~r_quad", 0.31)
         self.r_perc = rospy.get_param("~r_perc", 0.18)
@@ -105,6 +137,11 @@ class PlanarPlannerNode(object):
         self.d_clr = rospy.get_param("~d_clr", 0.05)
         self.r_safe = safe_radius(self.r_quad, self.r_perc, self.r_track,
                                   self.d_clr)
+        # MAP inflation, which is NOT r_safe: r_quad is the airframe disc and
+        # the validator already applies it against the raw map, so growing the
+        # map by it too would draw the vehicle radius twice. Display only.
+        self.r_eff = float(rospy.get_param("~r_eff",
+                                           self.r_safe - self.r_quad))
 
         self.pose_topic = rospy.get_param("~pose_topic", "/robot/pose_world")
         self.grid_topic = rospy.get_param("~grid_topic", "/grid_map")
@@ -129,18 +166,40 @@ class PlanarPlannerNode(object):
 
         # --------------------------------------------------------- planner
         limits = PlanarLimits(
-            v_max=rospy.get_param("~v_max", 1.5),
+            v_max=rospy.get_param("~v_max", 1.0),
             a_max=rospy.get_param("~a_max", 2.5),
             omega_max=rospy.get_param("~omega_max", 1.5),
             alpha_max=rospy.get_param("~alpha_max", 3.0),
             tilt_max=rospy.get_param("~tilt_max", 0.5236),
             j_max=rospy.get_param("~j_max", 8.0))
 
+        # INPUT-CHANGE COST, DEFAULTED OFF.
+        # R_dnu penalises |nu_k - nu_{k-1}|^2. The intent is "do not thrash the
+        # controller", but MPPI's exploration noise IS an input change, so the
+        # term bills every perturbed sample for being explored. Measured here
+        # against the live map at sigma=1.2: mean slew cost 27.6 per sample
+        # while sample 0 -- which IS the unperturbed nominal -- pays exactly 0.
+        # Its spread across samples (std 6.0) rivalled the goal terms (6.6),
+        # so the cheapest valid sample was consistently "change nothing". The
+        # nominal then could not accumulate: dU collapsed toward zero, warm_start
+        # shifted what little there was off the front, and the plan decayed from
+        # +0.27 m of progress to -0.13 m over 40 closed-loop solves.
+        #
+        # Smoothness does not depend on this term: clip_inputs() already
+        # projects onto |a_k - a_{k-1}| <= j_max*dt as a HARD constraint, so the
+        # emitted plan is slew-feasible with R_dnu = 0.
+        R_a = float(rospy.get_param("~r_dnu_a", 0.0))
+        R_alpha = float(rospy.get_param("~r_dnu_alpha", 0.0))
+
         weights = PlanarCostWeights(
+            R_dnu=(R_a, R_a, R_alpha),
             w_goal=rospy.get_param("~w_goal", 1.0),
             w_term_pos=rospy.get_param("~w_term_pos", 10.0),
             w_term_vel=rospy.get_param("~w_term_vel", 2.0),
             w_obs=rospy.get_param("~w_obs", 20.0),
+            # null/None -> PlanarCostWeights uses r_safe + 0.35, which is what
+            # the simulation was tuned with. Exposed so it can be swept.
+            d_influence=rospy.get_param("~d_influence", None),
             w_yaw=rospy.get_param("~w_yaw", 0.0),
             yaw_mode=rospy.get_param("~yaw_mode", "velocity"))
 
@@ -150,10 +209,35 @@ class PlanarPlannerNode(object):
             rospy.logwarn("[planar] ~require_map is FALSE -- flying with NO "
                           "obstacle set. Open-space checks only.")
 
-        self.dyn = PlanarDynamics(limits, dt=self.dt)
+        # CappedDynamics, matching `mppi.cap_velocity: true` in the
+        # simulator's config.yaml -- the velocity limit is enforced by
+        # PROJECTION inside the rollout instead of by discarding the sample.
+        # The node ran plain PlanarDynamics, which is a different expert: it
+        # throws away every sample that exceeds v_max rather than clipping it,
+        # so the accepted pool is a different distribution from the one every
+        # result in the simulator was produced with.
+        self.cap_velocity = bool(rospy.get_param("~cap_velocity", True))
+        dyn_cls = CappedDynamics if self.cap_velocity else PlanarDynamics
+        self.dyn = dyn_cls(limits, dt=self.dt)
         self.validator = PlanarSafetyValidator(self.free, self.r_safe)
-        self.planner = PlanarMPPI(
+        # Always FrontierMPPI, never PlanarMPPI. At w_frontier = 0 its frontier
+        # term short-circuits to zeros and at use_geodesic = False its goal
+        # correction returns 0.0, so the class IS PlanarMPPI in that setting --
+        # which keeps an A/B on either feature a change of a weight rather than
+        # a change of code path. Mirrors build_planner() in run_planar_sim.py.
+        # EUCLIDEAN BY DEFAULT. The geodesic field is rebuilt every solve
+        # (a Dijkstra over the traversable set) and measured ~+50% on the solve
+        # time here, which this vehicle does not have to spare. Turn it back on
+        # with _use_geodesic:=true when the map is open enough for the goal to
+        # sit behind something -- that is the case it exists for.
+        self.use_geodesic = bool(rospy.get_param("~use_geodesic", False))
+        self.w_frontier = float(rospy.get_param("~w_frontier", 0.0))
+        self.planner = FrontierMPPI(
             self.dyn, self.validator, weights=weights,
+            use_geodesic=self.use_geodesic,
+            w_frontier=self.w_frontier,
+            c_occupied=rospy.get_param("~c_occupied", 2.0),
+            c_unknown=rospy.get_param("~c_unknown", -4.0),
             horizon=self.horizon, num_samples=self.num_samples,
             sigma=(rospy.get_param("~sigma_ax", 1.2),
                    rospy.get_param("~sigma_ay", 1.2),
@@ -161,6 +245,12 @@ class PlanarPlannerNode(object):
             temperature=rospy.get_param("~temperature", 1.0),
             seed=int(rospy.get_param("~seed", 0)),
             goal_tol=rospy.get_param("~goal_tol", 0.25))
+        rospy.loginfo("[planar] cost: geodesic=%s w_frontier=%.2f "
+                      "R_dnu=(%.3g,%.3g) num_samples=%d horizon=%d "
+                      "dynamics=%s [planner/ from %s]",
+                      self.use_geodesic, self.w_frontier, R_a, R_alpha,
+                      self.num_samples, self.horizon,
+                      dyn_cls.__name__, _SRC)
 
         # ------------------------------------------------------------ state
         self.pose = None
@@ -188,6 +278,13 @@ class PlanarPlannerNode(object):
         self.pub_path = rospy.Publisher("~nominal_path", Path, queue_size=1)
         self.pub_viz = rospy.Publisher("~rollouts", MarkerArray, queue_size=1)
         self.pub_status = rospy.Publisher("~status", String, queue_size=1)
+        # Latched so a subscriber that joins late still learns the current
+        # answer instead of waiting for the next tick.
+        self.arrived_topic = rospy.get_param("~arrived_topic",
+                                             "/goal_arrive_tf")
+        self.pub_arrived = rospy.Publisher(self.arrived_topic, Bool,
+                                           queue_size=1, latch=True)
+        self.arrived = False
         self.pub_goal = rospy.Publisher("~goal_marker", Marker, queue_size=1,
                                         latch=True)
         # The unsafe set the validator actually uses -- occupied AND unknown AND
@@ -198,6 +295,12 @@ class PlanarPlannerNode(object):
         self.pub_unsafe = rospy.Publisher("~inflated", OccupancyGrid,
                                           queue_size=1, latch=True)
         self.publish_inflated = rospy.get_param("~publish_inflated", True)
+        # The r_quad half of r_safe, drawn as a separate ring so the two parts
+        # of the safety radius are distinguishable instead of one blob.
+        self.r_viz_expand = float(rospy.get_param("~r_viz_expand",
+                                                  self.r_quad))
+        self.pub_ring = rospy.Publisher("~inflated_outer", OccupancyGrid,
+                                        queue_size=1)
 
         rospy.loginfo("[planar] %s", self.planner.describe().replace("\n", "\n[planar] "))
         rospy.loginfo("[planar] r_safe=%.3f (r_Q %.2f + r_perc %.2f + "
@@ -242,6 +345,16 @@ class PlanarPlannerNode(object):
             occ = PlanarOccupancy.from_occupancy_grid_msg(
                 msg, occ_thresh=self.occ_thresh,
                 unknown_unsafe=self.unknown_unsafe)
+            # FOR THE OVERLAY ONLY, and attached here rather than asked of
+            # `planner/grid.py`. That module keeps one `unsafe` set by design
+            # and must stay byte-identical to the simulator's copy, so the
+            # occupied/unknown split -- which _publish_inflated needs to grow
+            # the WALLS without growing the unobserved region with them -- is
+            # recovered from the raw message in the ROS layer where it belongs.
+            v = np.asarray(msg.data, dtype=np.int16).reshape(
+                msg.info.height, msg.info.width)
+            occ.occupied = v >= int(self.occ_thresh)
+            occ.unknown = v < 0
         except Exception as e:
             rospy.logwarn_throttle(5.0, "[planar] grid parse failed: %s", e)
             return
@@ -251,6 +364,7 @@ class PlanarPlannerNode(object):
     def _goal_cb(self, msg):
         with self.lock:
             self.goal = np.array([msg.pose.position.x, msg.pose.position.y])
+            self.arrived = False        # a new goal un-latches the hold
         rospy.loginfo("[planar] new goal (%.2f, %.2f)", self.goal[0],
                       self.goal[1])
 
@@ -283,6 +397,32 @@ class PlanarPlannerNode(object):
 
         with self.lock:
             occ, goal = self.occ, self.goal.copy()
+
+        # ---------------------------------------------------- goal arrival
+        # Checked BEFORE solving: once the goal is reached there is nothing to
+        # plan, and continuing to solve would keep nudging the vehicle around
+        # inside goal_tol. Latched, because ||p - goal|| dithers across the
+        # tolerance and an unlatched test would flip in and out of hover.
+        # Only a NEW goal clears it (see _goal_cb).
+        if self.arrived or self.planner.at_goal(state, goal):
+            if not self.arrived:
+                self.arrived = True
+                # Freeze the hover here. publish_reference() falls back to
+                # self.hold whenever self.ref is None, so this IS the hover.
+                self.hold = (state.x, state.y, state.psi)
+                rospy.loginfo("[planar] GOAL REACHED (%.2f, %.2f), err %.2f m "
+                              "<= goal_tol %.2f -- holding",
+                              state.x, state.y,
+                              float(np.hypot(state.x - goal[0],
+                                             state.y - goal[1])),
+                              self.planner.goal_tol)
+            self.ref = None
+            self.pub_arrived.publish(Bool(data=True))
+            self._publish_goal(goal)
+            self._publish_status("ARRIVED holding (%.2f, %.2f)"
+                                 % (self.hold[0], self.hold[1]))
+            return
+        self.pub_arrived.publish(Bool(data=False))
 
         if self.require_map:
             if occ is None:
@@ -461,21 +601,23 @@ class PlanarPlannerNode(object):
         m.color.r, m.color.g, m.color.b, m.color.a = 0.1, 1.0, 0.2, 0.6
         self.pub_goal.publish(m)
 
-    def _publish_inflated(self, occ):
-        """Republish the validator's unsafe set as an OccupancyGrid.
+    def _publish_outer_ring(self, occ, d_occ, inner):
+        """One more inflation on top of the r_eff band. Visualisation only.
 
-        100 where a trajectory node would be rejected (clearance < r_safe),
-        0 where it is flyable. Overlay this on /grid_map in Foxglove and the
-        planner's behaviour stops being mysterious.
+        Only the RING is published -- cells inside the outer inflation that are
+        not already in the inner band. Publishing the filled disc would cover
+        the inner band and the two would be indistinguishable.
+
+            inner band  r_eff  = 0.28 m   map uncertainty
+            + this ring r_quad = 0.31 m   the airframe's own disc
+            = r_safe             0.59 m   what the validator gates on
+
+        Colour is a per-topic setting in the Foxglove 3D panel; it is
+        deliberately not baked into the message.
         """
-        if not self.publish_inflated or occ is None:
+        if self.pub_ring.get_num_connections() == 0:
             return
-        if self.pub_unsafe.get_num_connections() == 0:
-            return
-        xs = occ.origin[0] + (np.arange(occ.W) + 0.5) * occ.res
-        ys = occ.origin[1] + (np.arange(occ.H) + 0.5) * occ.res
-        gx, gy = np.meshgrid(xs, ys)
-        blocked = occ.clearance(gx, gy) < self.r_safe
+        ring = (d_occ < (self.r_eff + self.r_viz_expand)) & ~inner
 
         g = OccupancyGrid()
         g.header.stamp = rospy.Time.now()
@@ -487,7 +629,64 @@ class PlanarPlannerNode(object):
         g.info.origin.position.y = occ.origin[1]
         g.info.origin.position.z = 0.0
         g.info.origin.orientation.w = 1.0
-        g.data = np.where(blocked, 100, 0).astype(np.int8).reshape(-1).tolist()
+        g.data = np.where(ring, 100, -1).astype(np.int8).reshape(-1).tolist()
+        self.pub_ring.publish(g)
+
+    def _publish_inflated(self, occ):
+        """The obstacle set grown by r_eff, as a transparent overlay.
+
+        WHAT CHANGED, AND WHY
+        This used to publish `clearance(...) < r_safe`, which was wrong twice:
+
+          1. clearance() runs its EDT over `unsafe`, which is obstacle OR
+             unknown, so it grew the UNKNOWN region too. Early in a flight
+             nearly everything is unknown, so the layer was a near-solid block
+             that said nothing about where the walls are.
+          2. it grew obstacles by r_safe = 0.59 m. r_safe is the centre-to-
+             obstacle gate and already contains r_quad; the airframe disc is
+             not part of what the MAP should be inflated by. Growing the map by
+             it double-draws the vehicle radius.
+
+        What the map should absorb is only the uncertainty about where the
+        obstacle actually is:
+
+            r_eff = r_perc + r_track + d_clr = r_safe - r_quad = 0.28 m
+
+        The remaining r_quad is drawn separately by _publish_outer_ring, so
+        inner + ring still adds up to the 0.59 m the validator gates on.
+
+        Everything outside the band is published as -1, which Foxglove draws as
+        nothing. Publishing 0 for free cells paints an opaque sheet over the
+        whole extent and hides /grid_map underneath -- which is what this did
+        before. The raw occupied cells are excluded too, so the obstacle being
+        inflated stays visible from /grid_map instead of vanishing under its
+        own inflation.
+
+        A VIEW, NOT THE GATE. The validator still refuses unknown space, so
+        cells that look free here can still be rejected.
+        """
+        if not self.publish_inflated or occ is None:
+            return
+        if (self.pub_unsafe.get_num_connections() == 0
+                and self.pub_ring.get_num_connections() == 0):
+            return
+        if not hasattr(occ, "occupied"):
+            return
+        d_occ = distance_transform_edt(~occ.occupied) * occ.res
+        blocked = (d_occ < self.r_eff) & ~occ.occupied
+        self._publish_outer_ring(occ, d_occ, d_occ < self.r_eff)
+
+        g = OccupancyGrid()
+        g.header.stamp = rospy.Time.now()
+        g.header.frame_id = occ.frame_id or self.viz_frame
+        g.info.resolution = occ.res
+        g.info.width = occ.W
+        g.info.height = occ.H
+        g.info.origin.position.x = occ.origin[0]
+        g.info.origin.position.y = occ.origin[1]
+        g.info.origin.position.z = 0.0
+        g.info.origin.orientation.w = 1.0
+        g.data = np.where(blocked, 100, -1).astype(np.int8).reshape(-1).tolist()
         self.pub_unsafe.publish(g)
 
     def _publish_status(self, text):
