@@ -1,0 +1,167 @@
+<?xml version="1.0"?>
+<!--
+  2D horizontal occupancy grid directly from ZED depth + pose (no SLAM).
+  Runs only the grid node (+ optional rviz); the ZED wrapper itself is
+  expected to be already running from ~/script_startup.sh, which launches it as
+    ROS_NAMESPACE=rogx2 roslaunch zed_wrapper zed2i.launch
+
+  TWO MAPPERS, selected by `mapper:=`:
+
+    pointcloud  depth_to_grid.py        the original. Consumes
+                                        point_cloud/cloud_registered. Constant
+                                        inverse sensor model, jittered ray
+                                        sampling for free space. This is what
+                                        has flown.
+    andert      depth_to_grid_andert.py Andert IROS 2009 eqs. 8-11, the model
+                                        the simulator validates. Consumes
+                                        depth/depth_registered + camera_info.
+    both        both, on DIFFERENT topics (grid_topic / grid_topic_andert), so
+                they can be compared on matched header stamps while the planner
+                keeps reading the one it has always read.
+
+  Default is `pointcloud`: the new node does not take /grid_map until the
+  offline and hand-carried comparisons are clean. See the port plan.
+
+  Run:
+    roslaunch zed_rtabmap_example zed_depth_grid.launch camera_model:=zed2i
+    roslaunch zed_rtabmap_example zed_depth_grid.launch mapper:=both
+-->
+<launch>
+    <arg name="camera_model"   default="zed2i" />
+    <!-- must match the wrapper started by script_startup.sh: <ROS_NAMESPACE>/<camera_name> -->
+    <arg name="camera_name"    default="rogx2/zed2i" />
+    <arg name="zed_node_name"  default="zed_node" />
+    <arg name="base_frame"     default="base_link" />
+    <arg name="publish_urdf"   default="true" />
+    <arg name="open_rviz"      default="true" />
+
+    <!-- pointcloud | andert | both -->
+    <arg name="mapper"            default="pointcloud" />
+    <arg name="grid_topic"        default="/grid_map" />
+    <arg name="grid_topic_andert" default="/grid_map_andert" />
+
+    <!-- world frame whose Z is gravity-up. 'map' = ZED tracking (IMU-aligned).
+         Point this at your VICON world frame for drift-free grids. -->
+    <arg name="world_frame"    default="map" />
+    <arg name="resolution"     default="0.05" />
+    <!-- rectangular grid extents in the world (map) frame (m). Frame = robot's initial
+         heading: +x forward, +y left. Long arena side (10 m) is on x (forward), short
+         side (8 m) on y (lateral). Covers the arena with margin for a bottom-start ~[3-5,1]. -->
+    <arg name="grid_min_x"     default="-1.0" />   <!-- forward/heading -->
+    <arg name="grid_max_x"     default="10.0" />
+    <arg name="grid_min_y"     default="-5.0" />   <!-- lateral -->
+    <arg name="grid_max_y"     default="5.0" />
+    <!-- Fixed horizontal SLICE in the map frame. floor_alignment is OFF, so the map
+         origin = ZED-tracking START pose (0,0,0) and the ZED IMU keeps the map z-axis
+         vertical (grid plane parallel to the floor, verified ~0.3 deg off gravity).
+         Start the ZED node ON THE GROUND (before takeoff) => z=0 is the floor, pose z is
+         true altitude, and this [0.75,1.25] band is a fixed slice at 1.0 m above ground.
+         (If instead you start tracking while already hovering at 1 m, z=0 is the flight
+         height, so use a band centred on 0, e.g. -0.25..0.25.)
+         auto_floor OFF => band is absolute in world z, so the floor (constant negative z)
+         is always excluded, even with the camera tilted down.
+         THE ANDERT NODE READS THE SAME TWO NUMBERS, as centre +- half-thickness
+         (computed below), so `mapper:=both` differs in the MODEL and in nothing else. -->
+    <arg name="auto_floor"          default="false" />
+    <arg name="floor_z"             default="0.0" />
+    <!-- free-space prior around the robot (ZED min-range blind zone + startup
+         prior); seeded every frame, never overwrites confident obstacles -->
+    <arg name="near_free_enable"    default="true" />
+    <!-- free prior around the robot (below ~0.64 m the FOV cone cannot reach
+         the obstacle slice anyway; 1.0 also gives the planner takeoff room).
+         The ANDERT node asserts the same disc ONCE, at the first pose, and
+         never again — re-asserting it every frame paints free space over what
+         the camera actually measured. -->
+    <arg name="near_free_radius"    default="1.0" />
+    <!-- always-occupied wall ring around the configured extents (grid grows
+         outward by the thickness; the interior keeps the requested size) -->
+    <arg name="border_wall_enable"    default="true" />
+    <arg name="border_wall_thickness" default="0.1" />
+    <arg name="obstacle_min_height" default="0.75" />   <!-- slice bottom (m above ground) -->
+    <arg name="obstacle_max_height" default="1.25" />   <!-- slice top -->
+    <arg name="max_range"           default="6.0" />
+
+    <!-- Andert-only. decim strides the depth image AND its intrinsics;
+         rays_per_col caps how many rows per image COLUMN are walked (a column
+         is one bearing, so every row in it redraws the same line). Both are
+         compute knobs measured by perception/bench_fuse.py. z_max must stay
+         under res*fx or adjacent rays skip cells and far walls come back
+         perforated: 6.5 m at decim 2, 4.4 m at decim 3.
+         `decim` strides COLUMNS, which are bearings, so it sets the map's
+         angular resolution. `row_decim` (0 = same as decim) strides ROWS,
+         which only feed the height-band test; thinning those cuts the
+         per-pixel back-projection that rays_per_col does not touch, and costs
+         nothing until the band stops offering rays_per_col rows to choose
+         from. The node warns when that happens. -->
+    <arg name="decim"          default="2" />
+    <arg name="row_decim"      default="0" />
+    <arg name="rays_per_col"   default="8" />
+    <arg name="map_hz"         default="10.0" />
+    <arg name="z_min"          default="0.4" />
+
+    <!-- <group ns="$(arg camera_name)">
+        <include file="$(find zed_wrapper)/launch/include/zed_camera.launch.xml">
+            <arg name="camera_name"   value="$(arg camera_name)" />
+            <arg name="node_name"     value="$(arg zed_node_name)" />
+            <arg name="camera_model"  value="$(arg camera_model)" />
+            <arg name="base_frame"    value="$(arg base_frame)" />
+            <arg name="publish_urdf"  value="$(arg publish_urdf)" />
+        </include>
+    </group> -->
+
+    <!-- Point cloud -> 2D grid (the original) -->
+    <node if="$(eval arg('mapper') in ('pointcloud', 'both'))"
+          name="depth_to_grid" pkg="zed_rtabmap_example" type="depth_to_grid.py" output="screen">
+        <remap from="~cloud_in" to="/$(arg camera_name)/$(arg zed_node_name)/point_cloud/cloud_registered" />
+        <remap from="~grid_out" to="$(arg grid_topic)" />
+        <param name="world_frame"         value="$(arg world_frame)" />
+        <param name="resolution"          value="$(arg resolution)" />
+        <param name="grid_min_x"          value="$(arg grid_min_x)" />
+        <param name="grid_max_x"          value="$(arg grid_max_x)" />
+        <param name="grid_min_y"          value="$(arg grid_min_y)" />
+        <param name="grid_max_y"          value="$(arg grid_max_y)" />
+        <param name="obstacle_min_height" value="$(arg obstacle_min_height)" />
+        <param name="obstacle_max_height" value="$(arg obstacle_max_height)" />
+        <param name="auto_floor"          value="$(arg auto_floor)" />
+        <param name="floor_z"             value="$(arg floor_z)" />
+        <param name="near_free_enable"    value="$(arg near_free_enable)" />
+        <param name="near_free_radius"    value="$(arg near_free_radius)" />
+        <param name="border_wall_enable"    value="$(arg border_wall_enable)" />
+        <param name="border_wall_thickness" value="$(arg border_wall_thickness)" />
+        <param name="max_range"           value="$(arg max_range)" />
+    </node>
+
+    <!-- Depth image -> 2D grid, Andert IROS 2009 -->
+    <node if="$(eval arg('mapper') in ('andert', 'both'))"
+          name="depth_to_grid_andert" pkg="zed_rtabmap_example"
+          type="depth_to_grid_andert.py" output="screen">
+        <!-- The tail is memory-bound and threading it makes the p95 worse, not
+             better: measured on this box, p95 173 -> 98 ms with one thread.
+             A 10 Hz loop is decided by the tail. -->
+        <env name="OMP_NUM_THREADS" value="1" />
+        <remap from="~depth_in" to="/$(arg camera_name)/$(arg zed_node_name)/depth/depth_registered" />
+        <remap from="~info_in"  to="/$(arg camera_name)/$(arg zed_node_name)/depth/camera_info" />
+        <remap from="~grid_out" to="$(eval arg('grid_topic_andert') if arg('mapper') == 'both' else arg('grid_topic'))" />
+        <param name="world_frame"         value="$(arg world_frame)" />
+        <param name="resolution"          value="$(arg resolution)" />
+        <param name="grid_min_x"          value="$(arg grid_min_x)" />
+        <param name="grid_max_x"          value="$(arg grid_max_x)" />
+        <param name="grid_min_y"          value="$(arg grid_min_y)" />
+        <param name="grid_max_y"          value="$(arg grid_max_y)" />
+        <!-- the SAME slab as the point-cloud node, as centre +- half-thickness -->
+        <param name="plane_height" value="$(eval 0.5 * (float(arg('obstacle_min_height')) + float(arg('obstacle_max_height'))))" />
+        <param name="plane_tol"    value="$(eval 0.5 * (float(arg('obstacle_max_height')) - float(arg('obstacle_min_height'))))" />
+        <param name="border_wall_enable"    value="$(arg border_wall_enable)" />
+        <param name="border_wall_thickness" value="$(arg border_wall_thickness)" />
+        <param name="initial_free_radius" value="$(arg near_free_radius)" />
+        <param name="z_max"               value="$(arg max_range)" />
+        <param name="z_min"               value="$(arg z_min)" />
+        <param name="decim"               value="$(arg decim)" />
+        <param name="row_decim"           value="$(arg row_decim)" />
+        <param name="rays_per_col"        value="$(arg rays_per_col)" />
+        <param name="map_hz"              value="$(arg map_hz)" />
+    </node>
+
+    <node if="$(arg open_rviz)" name="rviz" pkg="rviz" type="rviz"
+          args="-d $(find zed_rtabmap_example)/rviz/grid2d.rviz" output="screen" />
+</launch>

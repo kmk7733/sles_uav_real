@@ -1,0 +1,62 @@
+Panels:
+  - Class: rviz/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /Map1
+      Splitter Ratio: 0.5
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz/Grid
+      Name: Grid
+      Color: 160; 160; 164
+      Cell Size: 1
+      Plane Cell Count: 20
+      Enabled: true
+    - Class: rviz/TF
+      Name: TF
+      Enabled: true
+      Show Names: true
+      Marker Scale: 0.5
+    - Class: rviz/Map
+      Name: Map
+      Enabled: true
+      Topic: /zed/map
+      Alpha: 0.9
+      Color Scheme: map
+      Draw Behind: false
+      Unreliable: false
+    - Class: rviz/Path
+      Name: MapPath
+      Enabled: true
+      Topic: /zed/mapPath
+      Color: 25; 255; 0
+      Line Style: Lines
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: map
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz/MoveCamera
+    - Class: rviz/Select
+    - Class: rviz/FocusCamera
+    - Class: rviz/Measure
+  Views:
+    Current:
+      Class: rviz/TopDownOrtho
+      Name: TopDown (2D)
+      Scale: 80
+      Angle: 0
+      Target Frame: map
+      X: 0
+      Y: 0
+    Saved: ~
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 900
+  Width: 1400

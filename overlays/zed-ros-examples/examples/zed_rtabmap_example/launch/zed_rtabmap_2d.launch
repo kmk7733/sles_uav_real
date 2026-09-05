@@ -1,0 +1,58 @@
+<?xml version="1.0"?>
+<!--
+  Headless 2D occupancy-grid mapping from a ZED camera using RTAB-Map.
+  Brings up the ZED wrapper + the rtabmap SLAM node (no GUI/rviz), loads the
+  tuned rtabmap_2d.yaml, and publishes a nav_msgs/OccupancyGrid on /zed/map.
+
+  Run:
+    roslaunch zed_rtabmap_example zed_rtabmap_2d.launch camera_model:=zed2i
+-->
+<launch>
+    <arg name="camera_model"   default="zed2i" />
+    <arg name="camera_name"    default="zed" />
+    <arg name="zed_node_name"  default="zed_node" />
+    <arg name="base_frame"     default="base_link" />
+    <arg name="publish_urdf"   default="true" />
+    <arg name="localization"   default="false" />
+    <arg name="open_rviz"          default="true" />   <!-- show the 2D map on the monitor -->
+    <arg name="map_always_update"  default="true" />   <!-- republish grid every cycle -->
+    <arg name="detection_rate"     default="10.0" />   <!-- target map update rate (Hz) -->
+
+    <arg     if="$(arg localization)" name="rtabmap_args" default="" />
+    <arg unless="$(arg localization)" name="rtabmap_args" default="--delete_db_on_start" />
+
+    <group ns="$(arg camera_name)">
+        <!-- ZED Wrapper Node (positional tracking + depth) -->
+        <include file="$(find zed_wrapper)/launch/include/zed_camera.launch.xml">
+            <arg name="camera_name"   value="$(arg camera_name)" />
+            <arg name="node_name"     value="$(arg zed_node_name)" />
+            <arg name="camera_model"  value="$(arg camera_model)" />
+            <arg name="base_frame"    value="$(arg base_frame)" />
+            <arg name="publish_urdf"  value="$(arg publish_urdf)" />
+        </include>
+
+        <!-- RTAB-Map (headless) -->
+        <node name="rtabmap" pkg="rtabmap_slam" type="rtabmap" output="screen" args="$(arg rtabmap_args)">
+            <rosparam command="load" file="$(find zed_rtabmap_example)/params/rtabmap_2d.yaml" />
+
+            <remap from="rgb/image"       to="$(arg zed_node_name)/rgb/image_rect_color" />
+            <remap from="depth/image"     to="$(arg zed_node_name)/depth/depth_registered" />
+            <remap from="rgb/camera_info" to="$(arg zed_node_name)/rgb/camera_info" />
+
+            <remap from="grid_map"        to="map" />
+            <remap from="odom"            to="$(arg zed_node_name)/odom" />
+
+            <!-- command-line overridable rate settings -->
+            <param name="map_always_update"    type="bool"   value="$(arg map_always_update)" />
+            <param name="Rtabmap/DetectionRate" type="string" value="$(arg detection_rate)" />
+
+            <param     if="$(arg localization)" name="Mem/IncrementalMemory" type="string" value="false" />
+            <param unless="$(arg localization)" name="Mem/IncrementalMemory" type="string" value="true" />
+            <param name="Mem/InitWMWithAllNodes" type="string" value="$(arg localization)" />
+        </node>
+
+        <!-- 2D map visualization on the connected monitor -->
+        <node if="$(arg open_rviz)" name="rviz" pkg="rviz" type="rviz"
+              args="-d $(find zed_rtabmap_example)/rviz/map2d.rviz" output="screen" />
+    </group>
+</launch>

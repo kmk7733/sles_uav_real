@@ -1,14 +1,23 @@
 # --- third-party packages: each has its own .git and upstream remote ---
-openmv_cam/
-vicon_bridge/
-vrpn_client_ros/
-zed-ros-examples/
-zed-ros-wrapper/
+#
+# LEADING SLASH, and it matters more here than anywhere else in this file.
+# A gitignore pattern with no slash matches at EVERY level, so the unanchored
+# `zed-ros-examples/` also matched `overlays/zed-ros-examples/` -- which meant
+# every file `overlays/` exists to protect was itself ignored. depth_to_grid.py,
+# vicon_map_align.py, pose_to_world.py and both launch files were untracked from
+# the day the directory was created, i.e. still one `git clean` from being lost,
+# which is the exact thing README.md says this directory prevents.
+/openmv_cam/
+/vicon_bridge/
+/vrpn_client_ros/
+/zed-ros-examples/
+/zed-ros-wrapper/
 
 # catkin toplevel symlink into /opt/ros
 CMakeLists.txt
 
 # build / runtime artifacts
+*.bak
 __pycache__/
 *.pyc
 *.bag

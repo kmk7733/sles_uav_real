@@ -1,0 +1,95 @@
+<?xml version="1.0"?>
+<!--
+  2D occupancy grid in the VICON WORLD frame.
+
+  vicon_map_align reads the robot's initial pose from /vicon/ROGX2/ROGX2 once at
+  startup and latches a static TF  vicon/world -> map  (ZED tracking frame).
+  From then on the ZED (map->base_link) carries localization; depth_to_grid
+  builds /grid_map directly in vicon/world through that TF chain.
+
+  Prereqs already running (script_startup.sh): ZED wrapper under /rogx2,
+  vicon_bridge (or pass start_vicon:=true to start it here).
+
+  Run:
+    roslaunch zed_rtabmap_example zed_vicon_grid.launch
+-->
+<launch>
+    <arg name="camera_model" default="zed2i" />
+    <arg name="open_rviz"    default="false" />
+    <!-- pointcloud | andert | both. See zed_depth_grid.launch; `both` runs the
+         two mappers on separate topics for an A/B on matched header stamps,
+         and the planner keeps reading grid_topic throughout. -->
+    <arg name="mapper"            default="pointcloud" />
+    <arg name="grid_topic"        default="/grid_map" />
+    <arg name="grid_topic_andert" default="/grid_map_andert" />
+    <arg name="decim"             default="2" />
+    <arg name="row_decim"         default="0" />
+    <arg name="rays_per_col"      default="8" />
+    <arg name="map_hz"            default="10.0" />
+    <arg name="start_vicon"  default="false" />
+    <arg name="vicon_topic"  default="/vicon/ROGX2/ROGX2" />
+    <!-- NO leading slash (tf2 convention). vicon_rogx.launch broadcasts the
+         same slash-less name, so TF and message frames match everywhere,
+         including in Foxglove (which strips slashes from message frame_ids
+         but not from TF frame names). -->
+    <arg name="world_frame"  default="vicon/world" />
+    <arg name="yaw_only"     default="true" />
+    <!-- Vicon-subject -> drone-body mount rotation (from attitude calibration) -->
+    <arg name="mount_calib"  default="$(find mpc_controller)/config/mount_calib.json" />
+
+    <!-- grid extents in the VICON world frame (m) = fixed room coordinates.
+         7 x 5 m map, 7 m on x and 5 m on y. NOT centred on the vicon origin:
+         x runs [-4.0, 3.0], shifted half a metre negative so the volume covers
+         where the vehicle actually starts and flies. The WIDTH is unchanged, so
+         the grid is still 144 x 104 cells after the border ring and only the
+         origin moves — nothing downstream is sized differently. -->
+    <arg name="grid_min_x"   default="-4.0" />
+    <arg name="grid_max_x"   default="3.0" />
+    <arg name="grid_min_y"   default="-2.5" />
+    <arg name="grid_max_y"   default="2.5" />
+    <!-- obstacle slice, ABSOLUTE z in vicon/world (vicon z=0 = floor if the
+         system was calibrated with the wand on the floor) -->
+    <arg name="obstacle_min_height" default="0.75" />
+    <arg name="obstacle_max_height" default="1.25" />
+
+    <include if="$(arg start_vicon)"
+             file="$(find vicon_bridge)/launch/vicon_rogx.launch" />
+
+    <node name="vicon_map_align" pkg="zed_rtabmap_example"
+          type="vicon_map_align.py" output="screen">
+        <param name="vicon_topic" value="$(arg vicon_topic)" />
+        <param name="world_frame" value="$(arg world_frame)" />
+        <param name="yaw_only"    value="$(arg yaw_only)" />
+        <param name="mount_calib" value="$(arg mount_calib)" />
+    </node>
+
+    <!-- localization pose re-expressed in the world frame (same frame as
+         /grid_map) for consumers like mpc_node that don't use TF -->
+    <arg name="pose_in"  default="/rogx2/zed2i/zed_node/pose" />
+    <arg name="pose_out" default="/robot/pose_world" />
+    <node name="pose_to_world" pkg="zed_rtabmap_example"
+          type="pose_to_world.py" output="screen">
+        <remap from="~pose_in"  to="$(arg pose_in)" />
+        <remap from="~pose_out" to="$(arg pose_out)" />
+        <param name="world_frame" value="$(arg world_frame)" />
+    </node>
+
+    <include file="$(find zed_rtabmap_example)/launch/zed_depth_grid.launch">
+        <arg name="camera_model"        value="$(arg camera_model)" />
+        <arg name="open_rviz"           value="$(arg open_rviz)" />
+        <arg name="world_frame"         value="$(arg world_frame)" />
+        <arg name="grid_min_x"          value="$(arg grid_min_x)" />
+        <arg name="grid_max_x"          value="$(arg grid_max_x)" />
+        <arg name="grid_min_y"          value="$(arg grid_min_y)" />
+        <arg name="grid_max_y"          value="$(arg grid_max_y)" />
+        <arg name="obstacle_min_height" value="$(arg obstacle_min_height)" />
+        <arg name="obstacle_max_height" value="$(arg obstacle_max_height)" />
+        <arg name="mapper"              value="$(arg mapper)" />
+        <arg name="grid_topic"          value="$(arg grid_topic)" />
+        <arg name="grid_topic_andert"   value="$(arg grid_topic_andert)" />
+        <arg name="decim"               value="$(arg decim)" />
+        <arg name="row_decim"           value="$(arg row_decim)" />
+        <arg name="rays_per_col"        value="$(arg rays_per_col)" />
+        <arg name="map_hz"              value="$(arg map_hz)" />
+    </include>
+</launch>

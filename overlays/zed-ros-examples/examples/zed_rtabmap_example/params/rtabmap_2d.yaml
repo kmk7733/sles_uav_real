@@ -1,0 +1,88 @@
+# RTAB-Map configuration tuned for a HORIZONTAL 2D occupancy grid from ZED depth.
+# Key differences vs the vendor rtabmap.yaml:
+#   * Grid/NormalsSegmentation: true  -> ground/obstacle split by surface normal
+#     (gravity direction) instead of a fixed height band -> robust to camera tilt.
+#   * Grid/MaxObstacleHeight raised so real obstacles are actually marked.
+#   * Grid/3D: false                  -> pure 2D grid (lighter on the Jetson).
+#   * DepthDecimation: 4              -> keep it real-time on Tegra.
+# ZED 2i has an IMU, so positional tracking (map frame) is already gravity-aligned,
+# which is what makes the projected plane truly horizontal.
+
+subscribe_depth:        true
+subscribe_rgbd:         false
+subscribe_stereo:       false
+subscribe_scan:         false
+subscribe_scan_cloud:   false
+subscribe_user_data:    false
+subscribe_odom_info:    false
+
+database_path:      "~/.ros/rtabmap.db"
+config_path:        "~/.ros/rtabmap.cfg"
+
+frame_id:       "base_link"
+map_frame_id:   "map"
+odom_frame_id:  "odom"
+odom_tf_angular_variance:  0.001
+odom_tf_linear_variance:   0.001
+tf_delay:       0.02
+publish_tf:     false
+
+odom_sensor_sync:               true
+wait_for_transform_duration:    0.2
+approx_sync:                    true
+
+queue_size: 10
+scan_normal_k:  0
+
+# --- high-rate / always-update settings ---
+map_always_update:  true       # republish the grid every cycle even with no new node
+
+Rtabmap:
+    DetectionRate:  10.0       # target processing/publish rate (Hz); 0 = as fast as possible
+    TimeThr:        0.0        # no per-cycle time budget throttling
+
+# Trim visual front-end so a cycle can fit in ~0.1 s on the Xavier
+Kp:
+    MaxFeatures:    300
+Vis:
+    MaxFeatures:    600
+
+Grid:
+    3D:                     false      # pure 2D projected grid (was true)
+    FlatObstacleDetected:   true
+    MapFrameProjection:     false      # project using local ground normal (tilt-robust)
+    GroundIsObstacle:       false
+    PreVoxelFiltering:      true
+    RayTracing:             true       # carve free space between sensor and hits
+    FromDepth:              true
+    NormalsSegmentation:    true       # <-- orientation-aware ground detection (was false)
+    CellSize:               0.05       # 5 cm cells
+    ClusterRadius:          0.1
+    MinClusterSize:         5
+    DepthDecimation:        4          # subsample depth 4x for real-time on Jetson (was 1)
+    DepthRoiRatios:         [0.0, 0.0, 0.0, 0.0]
+    FootprintHeight:        2.0
+    FootprintLength:        0.18
+    FootprintWidth:         0.18
+    MaxGroundAngle:         45.0       # surfaces up to 45deg from horizontal count as ground
+    MinGroundHeight:        0.0        # 0 = disabled; let normals decide the ground
+    MaxGroundHeight:        0.0        # 0 = disabled
+    MaxObstacleHeight:      2.0        # mark obstacles up to 2 m above ground (was 0.1)
+    NoiseFilteringMinNeighbors: 5
+    NoiseFilteringRadius:   0.1
+    NormalK:                20
+    RangeMin:               0.5
+    RangeMax:               5.0        # ZED 2i depth usable further out (was 3.0)
+
+GridGlobal:
+    Eroded:                 false
+    FootprintRadius:        0.18
+    FullUpdate:             true       # incremental (false) crashes rtabmap 0.21 OccupancyGrid::update(); keep true
+    MaxNodes:               0
+    MinSize:                1.0
+    OccupancyThr:           0.55
+    ProbClampingMax:        0.971
+    ProbClampingMin:        0.1192
+    ProbHit:                0.7
+    ProbMiss:               0.4
+    UpdateError:            0.01
