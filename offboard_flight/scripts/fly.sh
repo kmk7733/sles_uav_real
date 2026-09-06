@@ -5,8 +5,11 @@
 #   ~/catkin_ws/src/offboard_flight/scripts/fly.sh          bring the two up
 #   ~/catkin_ws/src/offboard_flight/scripts/fly.sh go       ...and arm + fly
 #   ~/catkin_ws/src/offboard_flight/scripts/fly.sh land     land now
-#   ~/catkin_ws/src/offboard_flight/scripts/fly.sh hold     freeze in place
-#   ~/catkin_ws/src/offboard_flight/scripts/fly.sh resume   continue after hold
+#
+# There is no `hold` or `resume`. HOLD is where the mission node FREEZES on a
+# fault -- planner silence, a bad setpoint, the fence, mission_timeout, a
+# landing that never confirmed -- and it is not somewhere you steer it by
+# hand. The manual override is the RC, which puts it in PILOT for good.
 #   ~/catkin_ws/src/offboard_flight/scripts/fly.sh state    where it is
 #   ~/catkin_ws/src/offboard_flight/scripts/fly.sh stop     kill both nodes
 #
@@ -181,8 +184,6 @@ go)
     ;;
 
 land)   rosservice call ${SRV}/land   ;;
-hold)   rosservice call ${SRV}/hold   ;;
-resume) rosservice call ${SRV}/resume ;;
 
 state)
     printf "mission  : "; timeout 3 rostopic echo -n1 ${SRV}/state 2>/dev/null \
@@ -197,6 +198,6 @@ state)
     ;;
 
 *)
-    echo "usage: $0 [start|go|land|hold|resume|state|stop]"; exit 1
+    echo "usage: $0 [start|go|land|state|stop]"; exit 1
     ;;
 esac
