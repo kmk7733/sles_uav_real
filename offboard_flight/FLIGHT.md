@@ -156,14 +156,41 @@ Logs: `/tmp/planner_live.log`, `/tmp/mission.log`, `/tmp/record.log`.
 
 ```bash
 ls -lh ~/bags/                         # flight_<date>_<profile>.bag
-rosbag info ~/bags/flight_*.bag
+$SCRIPTS/analyze_flight.py ~/bags/flight_XXXX.bag --geometry ~/obstacles.yaml
 ```
+
+`analyze_flight.py` prints what flew (from `~config`), the state timeline with
+durations, the ground-truth trajectory, **clearance to every Vicon obstacle**,
+and the planner's solve/valid statistics.
+
+The clearance block is the one that has never been measured on hardware.
+`r_safe = 0.51 m` is what the whole safety argument rests on, and until now it
+had only ever been checked against the occupancy grid — which is the planner's
+*belief*. With the obstacles in Vicon it becomes a measurement.
+
+**Vicon gives a pose, not an extent.** Without geometry the tool reports
+centre-to-centre distance and labels it `CENTRE`; it will not invent a radius.
+Measure the obstacles once and keep the file:
+
+```bash
+$SCRIPTS/analyze_flight.py --template > ~/obstacles.yaml
+# then edit: pillar1: {shape: disc, radius: 0.15}
+#            wall1:   {shape: box,  sx: 2.00, sy: 0.10}
+```
+
+How to read the verdict:
+
+| worst surface clearance | means |
+|---|---|
+| `>= r_safe` (0.51) | as designed |
+| between `r_quad` (0.31) and `r_safe` | the airframe was clear, but the gate is on the belief map — so **the grid did not see the obstacle where Vicon says it is**. A perception result, not a planner one |
+| `< r_quad` | the airframe disc intersected a real obstacle |
 
 What is in it and why:
 
 | group | topics |
 |---|---|
-| ground truth | `/vicon/.*` (**every** subject, obstacles included), `/robot/pose_world` |
+| ground truth | `/vicon/.*` — **every** subject: `ROGX2`, plus `pillar1`, `pillar2`, …, `wall1`, … The bridge has no subject filter, so anything in Tracker is recorded without editing a script. `/robot/pose_world` |
 | perception | `/grid_map`, `~inflated`, `~inflated_outer` |
 | decision | `~config`, `~status`, `~nominal_path`, `~rollouts`, `~goal_marker`, `/goal_arrive_tf` |
 | execution | `commander/set_pose`, `setpoint_raw/local`, `setpoint_raw/target_local`, `local_position/pose`, `velocity_local`, `imu/data`, `battery` |
