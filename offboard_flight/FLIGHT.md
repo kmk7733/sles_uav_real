@@ -239,6 +239,40 @@ timid against it is usually hugging the inflated set instead.
 
 ---
 
+## OPEN: recording is not a passive observer
+
+**Suspected, mechanism confirmed, effect not yet measured.** After the bag was
+added, a flight showed the yaw oscillating left-right-left-right while
+advancing. No weight or parameter changed across that commit — `PLANNER_ARGS`
+was `_plan_rate:=5` before and after, and the only planner diff was a
+read-only `~config` publisher. What changed is the LOAD.
+
+`record_flight.sh` subscribes to three topics that the planner **skips
+entirely when nobody is subscribed** (`planar_planner_node.py:682, 741, 793`,
+`get_num_connections() == 0`):
+
+    ~rollouts          a 30 x 31 point MarkerArray, rebuilt every solve
+    ~inflated          two grid-wide distance_transform_edt every solve
+    ~inflated_outer    another EDT
+
+All three run **inside `plan_once`, on the same thread as the solve**. So
+starting the bag makes the planner do three pieces of work per tick that it
+was not doing before. A longer plan period means each plan's yaw trajectory is
+followed for longer, and nothing damps yaw: `w_yaw = 0`, so yaw appears in no
+cost term and is a random walk weighted only by the position cost.
+
+`/vicon/markers` is the same shape — `vicon_bridge` streams markers only while
+something subscribes, so recording turns that on too (5532 messages in the
+first flight bag).
+
+TO MEASURE, and it is one comparison: run the planner with `RECORD=0`, read
+`solve=` off `~status`, then start `record_flight.sh` separately and read it
+again. Same planner, only the recorder changes.
+
+IF CONFIRMED, the fix is not to stop recording. Move the visualisation
+publishing off the plan thread, or gate it on a rate rather than on a
+subscriber, so that observing the planner does not change it.
+
 ## Not yet exercised
 
 Honest list, so nothing here is a surprise in the air:
@@ -248,6 +282,10 @@ Honest list, so nothing here is a surprise in the air:
 - **`FOXGLOVE=0` has not been run end to end.**
 - **`RC_MAP_KILL_SW` has not been confirmed on the ground.** Do this before
   the first arm of the day.
+- **A bag has been closed cleanly exactly zero times.** The first flight bag
+  came out `.active` because the recorder did not get its SIGINT. `rosbag
+  reindex` recovered it whole, but `fly.sh stop` is what should be closing it
+  and that path has not been shown to work.
 - **`FOXGLOVE=0` is now measured** (it is worth 119 → 70 ms), but no flight has
   been flown with it off, so the Foxglove-blind procedure itself is untried.
 - **No flight has used `_use_geodesic:=false`.** The 10 Hz default trades the
