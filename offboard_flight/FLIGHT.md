@@ -69,17 +69,30 @@ rostopic echo -n3 /rogx2/planar_planner_node/status    # valid=, solve=
 |---|---|---|
 | `/grid_map` | ~7 Hz | the mapper is behind; check `~/gridmap_output.log` |
 | `world->FCU` | `t=[...] n>=10` | the planner will publish NO setpoints and the mission node will never arm. Both `/robot/pose_world` and `mavros/local_position/pose` must be live, with stamps inside 0.3 s of each other |
-| `valid=` | 130–150 / 192 | below ~40 the map is mostly unknown; look at `~inflated` in Foxglove |
-| `solve=` | 130–260 ms | see below |
+| `valid=` | 50–70% | below ~30% the map is mostly unknown; look at `~inflated` in Foxglove |
+| `solve=` | p50 ~70 ms | see below |
 
-`solve` is measured against a 100 ms tick budget, so it does not fit at
-`plan_rate` 10 and `fly.sh` already defaults to **`_plan_rate:=5`**. If solves
-are consistently above ~350 ms, drop it further:
-`PLANNER_ARGS="_plan_rate:=4" $SCRIPTS/fly.sh`.
+`fly.sh` defaults to `_plan_rate:=10 _num_samples:=96 _use_geodesic:=false`,
+measured at p50 70 ms / p95 134 with `FOXGLOVE=0`. **Two things about that:**
 
-Rate is not the thing to protect — replanning *distance* is. At v_max 0.31 m/s,
-5 Hz is 6.2 cm of travel per cycle against a 3.0 s / 0.93 m horizon, finer than
-the old 10 Hz at v_max 1.0, which was 10 cm.
+**It needs `FOXGLOVE=0`.** `foxglove_nodelet_manager` is 27% of a core, and the
+same config measures p50 119 ms with it running. Watching live costs the plan
+rate; pick one.
+
+**It is not config.yaml's planner.** Lowering `num_samples` cannot reach 10 Hz —
+with the geodesic on, K 192 → 128 made it *worse*, and with it off, K 96 → 64
+changed nothing. The geodesic is the whole difference (104 ms vs 70 at the same
+K=96), and it is what removes the local minima of `‖p − goal‖` when the goal
+sits behind an obstacle. To fly the validated planner instead:
+
+```bash
+PLANNER_ARGS="_plan_rate:=5" $SCRIPTS/fly.sh    # K=192, geodesic on
+```
+
+That measures p50 119 / p95 154 against a 200 ms budget — more margin than
+anything in the 10 Hz column. Rate is not the thing to protect; replanning
+*distance* is, and at v_max 0.31 m/s, 5 Hz is 6.2 cm per cycle against a
+3.0 s / 0.93 m horizon.
 
 ## 5 · Planner live, mission node up, recording on
 
@@ -235,5 +248,7 @@ Honest list, so nothing here is a surprise in the air:
 - **`FOXGLOVE=0` has not been run end to end.**
 - **`RC_MAP_KILL_SW` has not been confirmed on the ground.** Do this before
   the first arm of the day.
-- **Solve time above is measured with the visualisation running.** It should
-  only improve with `FOXGLOVE=0 VIZ=0`, but that has not been measured.
+- **`FOXGLOVE=0` is now measured** (it is worth 119 → 70 ms), but no flight has
+  been flown with it off, so the Foxglove-blind procedure itself is untried.
+- **No flight has used `_use_geodesic:=false`.** The 10 Hz default trades the
+  planner's only defence against local minima for the rate.

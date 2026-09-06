@@ -48,22 +48,47 @@ SRV=/${NS}/mission_node
 # sqrt(2)*res ~ 0.071 m -- and says to cover it manually where r_eff is used.
 # This is that cover. Set _d_clr:=0.0 to match the simulator exactly.
 #
-# _plan_rate 5, AND IT IS A MEASUREMENT, not a preference. On this Xavier with
-# the ZED, the Andert mapper at 7 Hz, vicon_bridge and foxglove_bridge all
-# running, the aligned solve measures 133-255 ms with occasional 400-750 ms
-# spikes -- against planner/bench.py's 86.7 ms for the identical settings on an
-# IDLE box. Left at 10 Hz the rospy.Timer simply fires again the moment the
-# callback returns, so the planner runs back to back and eats a core the mapper
-# needs. 5 Hz gives it room.
+# 10 Hz, AND WHAT IT COST. Measured on the NODE -- not plan() in a loop --
+# against the live stack, 40 status ticks each, FOXGLOVE=0 VIZ=0:
 #
-# It costs less than it sounds. Replanning distance, not rate, is what matters:
-# at v_max 0.31 m/s, 5 Hz is 6.2 cm of travel per cycle against a 3.0 s / 0.93 m
-# horizon. The old 10 Hz at v_max 1.0 was 10 cm, so this replans FINER than
-# what was flown before while thinking further ahead.
+#   geodesic   N    K    p50   p95    over 100 ms
+#   --------  ---  ---  ----  ----   ------------
+#     on       30  192   119   154        100%     <- config.yaml's planner
+#     on       30  128   131   250        100%
+#     on       30   96   104   126         62%
+#     on       25   96   124   417         92%
+#    OFF       30   96    70   134         25%     <- this
+#    OFF       30   64    70   130         20%
 #
-# Sweep by passing PLANNER_ARGS, e.g.
-#   PLANNER_ARGS="_w_frontier:=0 _plan_rate:=10" fly.sh
-PLANNER_ARGS=${PLANNER_ARGS:-"_plan_rate:=5"}
+# LOWERING num_samples IS NOT THE LEVER, and the table says so twice: with the
+# geodesic on, K 192 -> 128 made it WORSE, and with it off, K 96 -> 64 changed
+# the median by nothing. The geodesic is the whole difference -- 104 ms against
+# 70 at the same K=96. It is a grid-wide Dijkstra rebuilt once per solve and it
+# does not care how many samples were drawn.
+#
+# So _use_geodesic:=false is what buys 10 Hz. That is a real loss: the geodesic
+# replaces ||p - goal|| with distance measured ALONG traversable space and is
+# the fix for "the planner stops at a wall with the goal behind it". Euclidean
+# has local minima; a geodesic field has none by construction. w_frontier 5.0
+# stays on and partly covers the same ground -- it rewards moving where UNKNOWN
+# blocks the line of sight -- but it is not the same guarantee.
+#
+# THIS NEEDS FOXGLOVE=0. foxglove_nodelet_manager is 27% of a core here and the
+# same K=96 geodesic-off config measures p50 119 with it running instead of 70.
+# Watching the flight live costs you the plan rate; pick one.
+#
+# TO FLY config.yaml's PLANNER EXACTLY, at 5 Hz:
+#   PLANNER_ARGS="_plan_rate:=5" fly.sh
+# K=192 with the geodesic measures p50 119 / p95 154 against a 200 ms budget --
+# 60% and 77% of it, more margin than anything in the 10 Hz column. At
+# v_max 0.31 m/s, 5 Hz is 6.2 cm of travel per replan against a 3.0 s / 0.93 m
+# horizon, so the geodesic costs distance resolution the vehicle does not need.
+#
+# The principled fix is to rebuild the field every Nth solve rather than every
+# solve, since the map changes far slower than the plan does. That is a change
+# to planner/haa/cost.py, byte-identical to the simulator's copy by invariant,
+# so it belongs there first and not here.
+PLANNER_ARGS=${PLANNER_ARGS:-"_plan_rate:=10 _num_samples:=96 _use_geodesic:=false"}
 GOAL_X=${GOAL_X:-2.0}
 GOAL_Y=${GOAL_Y:-0.0}
 MISSION_ARGS=${MISSION_ARGS:-""}
