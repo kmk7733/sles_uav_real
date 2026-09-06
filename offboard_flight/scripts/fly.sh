@@ -43,9 +43,22 @@ SRV=/${NS}/mission_node
 # sqrt(2)*res ~ 0.071 m -- and says to cover it manually where r_eff is used.
 # This is that cover. Set _d_clr:=0.0 to match the simulator exactly.
 #
+# _plan_rate 5, AND IT IS A MEASUREMENT, not a preference. On this Xavier with
+# the ZED, the Andert mapper at 7 Hz, vicon_bridge and foxglove_bridge all
+# running, the aligned solve measures 133-255 ms with occasional 400-750 ms
+# spikes -- against planner/bench.py's 86.7 ms for the identical settings on an
+# IDLE box. Left at 10 Hz the rospy.Timer simply fires again the moment the
+# callback returns, so the planner runs back to back and eats a core the mapper
+# needs. 5 Hz gives it room.
+#
+# It costs less than it sounds. Replanning distance, not rate, is what matters:
+# at v_max 0.31 m/s, 5 Hz is 6.2 cm of travel per cycle against a 3.0 s / 0.93 m
+# horizon. The old 10 Hz at v_max 1.0 was 10 cm, so this replans FINER than
+# what was flown before while thinking further ahead.
+#
 # Sweep by passing PLANNER_ARGS, e.g.
-#   PLANNER_ARGS="_w_frontier:=0 _plan_rate:=5" fly.sh
-PLANNER_ARGS=${PLANNER_ARGS:-""}
+#   PLANNER_ARGS="_w_frontier:=0 _plan_rate:=10" fly.sh
+PLANNER_ARGS=${PLANNER_ARGS:-"_plan_rate:=5"}
 GOAL_X=${GOAL_X:-2.0}
 GOAL_Y=${GOAL_Y:-0.0}
 MISSION_ARGS=${MISSION_ARGS:-""}
@@ -71,16 +84,15 @@ start)
     if ! rostopic list >/dev/null 2>&1; then
         echo "no ROS master -- run ~/start_test_grid.sh vicon first"; exit 1
     fi
+    # ONE node, not one per topic. Each `rostopic echo` pays a full node
+    # registration before it can hear anything, and against /mavros/state at
+    # 1 Hz a few seconds of budget loses that race and reports NO DATA on a
+    # healthy link. preflight.py subscribes to all four at once.
     echo "pre-flight:"
-    for t in /${NS}/mavros/state /${NS}/mavros/local_position/pose \
-             /robot/pose_world /grid_map; do
-        if timeout 5 rostopic echo -n1 "$t" >/dev/null 2>&1; then
-            echo "  $t   ok"
-        else
-            echo "  $t   NOT PUBLISHING"
-        fi
-    done
-    echo
+    if ! python3 "$SCRIPTS/preflight.py"; then
+        echo "  refusing to start the planner until those are up"
+        exit 1
+    fi
 
     _kill_flight_nodes
     cd "$SCRIPTS" || exit 1
