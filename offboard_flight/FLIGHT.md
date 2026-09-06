@@ -63,42 +63,46 @@ either is missing.
 > race on a healthy link. It is 12 s now — measured, 3 s reported NO DATA on a
 > link that answered at 12.
 
-## 4 · The three numbers that decide whether you fly
+## 4 · The numbers that decide whether you fly
 
 ```bash
-rostopic hz /grid_map                                  # ~7 Hz
+rostopic hz /grid_map                                  # ~7-10 Hz
 grep -a "world->FCU" /tmp/planner_dry.log | tail -1    # n >= 10, not NOT READY
-rostopic echo -n3 /rogx2/planar_planner_node/status    # valid=, solve=
+rostopic echo -n3 /rogx2/planar_planner_node/status    # valid=, solve=, viz=
 ```
 
 | | expected | if not |
 |---|---|---|
-| `/grid_map` | ~7 Hz | the mapper is behind; check `~/gridmap_output.log` |
-| `world->FCU` | `t=[...] n>=10` | the planner will publish NO setpoints and the mission node will never arm. Both `/robot/pose_world` and `mavros/local_position/pose` must be live, with stamps inside 0.3 s of each other |
-| `valid=` | 50–70% | below ~30% the map is mostly unknown; look at `~inflated` in Foxglove |
-| `solve=` | p50 ~70 ms | see below |
+| `/grid_map` | ~7–10 Hz | the mapper is behind; check `~/gridmap_output.log` |
+| `world->FCU` | `t=[...] n>=10` | the planner publishes NO setpoints and the mission node never arms. Both `/robot/pose_world` and `mavros/local_position/pose` must be live, with stamps inside 0.3 s of each other |
+| `valid=` | 50–70% | below ~30% the map is mostly unknown. Not visible live any more — `analyze_flight.py` rebuilds the inflated set from the bag, or set `_publish_inflated:=true` and pay 8.5 ms a tick |
+| `solve=` | p50 ~120 ms | against a 200 ms budget at `plan_rate` 5 |
+| `viz=` | **0 ms** | anything else means something subscribed to `~rollouts` or `~inflated` and the planner is doing work for it, inside the solve's own thread. Usually a Foxglove panel or a bag |
 
-`fly.sh` defaults to `_plan_rate:=10 _num_samples:=96 _use_geodesic:=false`,
-measured at p50 70 ms / p95 134 with `FOXGLOVE=0`. **Two things about that:**
+### What is flying, and why the rate is 5
 
-**It needs `FOXGLOVE=0`.** `foxglove_nodelet_manager` is 27% of a core, and the
-same config measures p50 119 ms with it running. Watching live costs the plan
-rate; pick one.
+`fly.sh` passes only `_plan_rate:=5`. Everything else is the node's default,
+and the node's defaults are config.yaml's: **K=192, horizon 30, geodesic on,
+R_dnu (1, 1, 0.2), d_influence 0.60, w_frontier 5.0, v_max 0.31**. That is the
+planner every simulator result was produced with, and only the rate is
+conceded to the hardware.
 
-**It is not config.yaml's planner.** Lowering `num_samples` cannot reach 10 Hz —
-with the geodesic on, K 192 → 128 made it *worse*, and with it off, K 96 → 64
-changed nothing. The geodesic is the whole difference (104 ms vs 70 at the same
-K=96), and it is what removes the local minima of `‖p − goal‖` when the goal
-sits behind an obstacle. To fly the validated planner instead:
+Lowering `num_samples` does not buy a faster tick. Measured on the node with
+`FOXGLOVE=0`: with the geodesic on, K 192 → 128 made it *worse* (119 → 131 ms);
+with it off, K 96 → 64 changed nothing (70 → 70). The geodesic is the whole
+difference — 104 ms against 70 at the same K=96 — because it is a grid-wide
+Dijkstra rebuilt once per solve that does not care how many samples were drawn.
+
+So 10 Hz is available only by deleting the geodesic, which is what removes the
+local minima of `‖p − goal‖` when the goal sits behind an obstacle. Rate is the
+cheaper thing to give up: replanning *distance* is what matters, and at
+v_max 0.31 m/s, 5 Hz is 6.2 cm per cycle against a 3.0 s / 0.93 m horizon.
+
+If you want it anyway:
 
 ```bash
-PLANNER_ARGS="_plan_rate:=5" $SCRIPTS/fly.sh    # K=192, geodesic on
+PLANNER_ARGS="_plan_rate:=10 _num_samples:=96 _use_geodesic:=false" $SCRIPTS/fly.sh
 ```
-
-That measures p50 119 / p95 154 against a 200 ms budget — more margin than
-anything in the 10 Hz column. Rate is not the thing to protect; replanning
-*distance* is, and at v_max 0.31 m/s, 5 Hz is 6.2 cm per cycle against a
-3.0 s / 0.93 m horizon.
 
 ## 5 · Planner live, mission node up, recording on
 
@@ -124,9 +128,11 @@ Wait for this line before continuing:
 ## 6 · RC in hand
 
 - Transmitter on, **Position mode**, kill switch located.
-- Foxglove: `/grid_map`, `nominal_path`, `rollouts`, goal marker, the 0.31 m
-  footprint circle.
-- Confirm the goal marker is where you expect: **(2.0, 0.0)**.
+- Confirm the goal: `rostopic echo -n1 /rogx2/planar_planner_node/config`
+  should say `"goal": [2.0, 0.0]`.
+- **There is nothing to watch unless you started with `FOXGLOVE=1`**, and if
+  you did, `viz=` in the status line will no longer be 0 and the plan rate is
+  paying for it. On a measurement run, fly blind and read the bag afterwards.
 
 ## 7 · Fly
 
@@ -220,8 +226,8 @@ What is in it and why:
 | group | topics |
 |---|---|
 | ground truth | `/vicon/.*` — **every** subject: `ROGX2`, plus `pillar1`, `pillar2`, …, `wall1`, … The bridge has no subject filter, so anything in Tracker is recorded without editing a script. `/robot/pose_world` |
-| perception | `/grid_map`, `~inflated`, `~inflated_outer` |
-| decision | `~config`, `~status`, `~nominal_path`, `~rollouts`, `~goal_marker`, `/goal_arrive_tf` |
+| perception | `/grid_map` — `~inflated` is NOT recorded; `analyze_flight.py` rebuilds it from this plus `r_safe` |
+| decision | `~config`, `~status`, `~nominal_path`, `~goal_marker`, `/goal_arrive_tf` |
 | execution | `commander/set_pose`, `setpoint_raw/local`, `setpoint_raw/target_local`, `local_position/pose`, `velocity_local`, `imu/data`, `battery` |
 | state machine | `mission_node/state`, `mavros/state`, `mavros/extended_state`, `/rosout_agg` |
 
@@ -239,60 +245,61 @@ for _, m, _ in b.read_messages('/rogx2/planar_planner_node/config'):
 PY
 ```
 
-`~inflated` is worth as much as `/grid_map`. The raw grid shows neither the
-unknown-is-unsafe rule nor the r_safe growth, so a path that looks needlessly
-timid against it is usually hugging the inflated set instead.
+The raw grid shows neither the unknown-is-unsafe rule nor the `r_safe` growth,
+so a path that looks needlessly timid against it is usually hugging the
+inflated set instead. `analyze_flight.py` prints that set — rebuilt, not
+recorded — under **WHAT THE VALIDATOR GATED ON**.
 
 ---
 
-## OPEN: recording is not a passive observer
+## Observing the planner used to change it
 
-**Suspected, mechanism confirmed, effect not yet measured.** After the bag was
-added, a flight showed the yaw oscillating left-right-left-right while
-advancing. No weight or parameter changed across that commit — `PLANNER_ARGS`
-was `_plan_rate:=5` before and after, and the only planner diff was a
-read-only `~config` publisher. What changed is the LOAD.
+Kept because the shape of the bug is worth recognising again. After the bag
+was added, a flight showed the yaw oscillating left-right-left-right while
+advancing. No weight or parameter had changed across that commit — the only
+planner diff was a read-only `~config` publisher. What changed was the LOAD.
 
-`record_flight.sh` subscribes to three topics that the planner **skips
-entirely when nobody is subscribed** (`planar_planner_node.py:682, 741, 793`,
-`get_num_connections() == 0`):
+`~rollouts`, `~inflated` and `~inflated_outer` **skip their work entirely when
+nobody is subscribed** (`planar_planner_node.py:682, 741, 793`), and all three
+run **inside `plan_once`, on the solve's own thread**. `record_flight.sh` was
+subscribing to them, so starting the bag switched on 8.5 ms (p95 22.8) of
+distance transforms and 2.6 ms of marker building per tick. The recorder was
+not an observer; it was a load.
 
-    ~rollouts          a 30 x 31 point MarkerArray, rebuilt every solve
-    ~inflated          two grid-wide distance_transform_edt every solve
-    ~inflated_outer    another EDT
+Fixed three ways, so it cannot come back quietly:
 
-All three run **inside `plan_once`, on the same thread as the solve**. So
-starting the bag makes the planner do three pieces of work per tick that it
-was not doing before. A longer plan period means each plan's yaw trajectory is
-followed for longer, and nothing damps yaw: `w_yaw = 0`, so yaw appears in no
-cost term and is a random walk weighted only by the position cost.
+- `~inflated` and `~rollouts` default **off**. Nothing is lost: the inflated
+  set is a pure function of `/grid_map` and `r_safe`, both in the bag, and
+  `analyze_flight.py` rebuilds it exactly.
+- The recorder no longer subscribes to any of the three.
+- The status line carries `viz=Nms` beside `solve=Nms`, and the node warns
+  when visualisation exceeds 15% of a tick. **`viz=` should read 0.**
 
-`/vicon/markers` is the same shape — `vicon_bridge` streams markers only while
-something subscribes, so recording turns that on too (5532 messages in the
-first flight bag).
-
-TO MEASURE, and it is one comparison: run the planner with `RECORD=0`, read
-`solve=` off `~status`, then start `record_flight.sh` separately and read it
-again. Same planner, only the recorder changes.
-
-IF CONFIRMED, the fix is not to stop recording. Move the visualisation
-publishing off the plan thread, or gate it on a rate rather than on a
-subscriber, so that observing the planner does not change it.
+Still open: nobody has measured what that load did to the *yaw* specifically.
+11 ms on a ~120 ms tick is ~9%, which is real but may not be the whole story —
+`w_yaw = 0`, so yaw appears in no cost term at all and is a random walk
+weighted only by the position cost. If the oscillation survives with `viz=0`,
+that is where to look next.
 
 ## Not yet exercised
 
 Honest list, so nothing here is a surprise in the air:
 
 - **`/goal_arrive_tf` has never fired.** If it does not, `MISSION` ends in
-  `HOLD` at `mission_timeout` — it will not descend. Land with `fly.sh land`.
-- **`FOXGLOVE=0` has not been run end to end.**
+  `HOLD` at `mission_timeout` — it will **not** descend. Land with
+  `fly.sh land`.
 - **`RC_MAP_KILL_SW` has not been confirmed on the ground.** Do this before
   the first arm of the day.
-- **A bag has been closed cleanly exactly zero times.** The first flight bag
-  came out `.active` because the recorder did not get its SIGINT. `rosbag
-  reindex` recovered it whole, but `fly.sh stop` is what should be closing it
-  and that path has not been shown to work.
-- **`FOXGLOVE=0` is now measured** (it is worth 119 → 70 ms), but no flight has
-  been flown with it off, so the Foxglove-blind procedure itself is untried.
-- **No flight has used `_use_geodesic:=false`.** The 10 Hz default trades the
-  planner's only defence against local minima for the rate.
+- **No bag has ever been closed cleanly.** The first flight bag came out
+  `.active` because the recorder did not get its SIGINT; `rosbag reindex`
+  recovered it whole, but `fly.sh stop` is what should be closing it and that
+  path is unproven. Check for `*.active` in `~/bags/` after every flight.
+- **No flight has been flown with Foxglove off.** The saving is measured
+  (119 → 70 ms) but flying blind, with the bag as the only record, is a
+  different procedure from the ones flown so far.
+- **`_use_geodesic:=false` has never flown.** It is opt-in now, not the
+  default, but if you reach for the 10 Hz line above, that is what you are
+  flying.
+- **The yaw oscillation is not explained.** See the section above: the
+  recording load is fixed and `viz=` now makes it visible, but whether that
+  was the cause is unmeasured, and `w_yaw = 0` remains a candidate.
