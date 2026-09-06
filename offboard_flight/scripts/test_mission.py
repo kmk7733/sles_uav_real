@@ -310,16 +310,10 @@ class Harness(object):
         # vehicle: track the last setpoint, first order, only while armed
         if self.published and self.armed and self.mode == "OFFBOARD":
             sp = self.published[-1][1]
-            if sp.type_mask & PositionTarget.IGNORE_PZ:
-                self.z += sp.velocity.z * dt
-                self.x += sp.velocity.x * dt
-                self.y += sp.velocity.y * dt
-            else:
-                tau = 0.25
-                a = min(dt / tau, 1.0)
-                self.x += a * (sp.position.x - self.x)
-                self.y += a * (sp.position.y - self.y)
-                self.z += a * (sp.position.z - self.z)
+            a = min(dt / 0.25, 1.0)
+            self.x += a * (sp.position.x - self.x)
+            self.y += a * (sp.position.y - self.y)
+            self.z += a * (sp.position.z - self.z)
         self.z = max(self.z, self.z_ground)
         self.landed = (ExtendedState.LANDED_STATE_ON_GROUND
                        if self.z - self.z_ground < 0.05
@@ -418,9 +412,9 @@ print("NOMINAL MISSION -- start, takeoff, hover, fly to goal, land, disarm")
 node = fly(max_seconds=90.0)
 seq = HARNESS.states
 print("       states: %s" % " -> ".join(seq))
-check("STREAM" in seq and "TAKEOFF" in seq, "streams then takes off")
-check(seq.index("TAKEOFF") < seq.index("HOVER") < seq.index("MISSION"),
-      "TAKEOFF before HOVER before MISSION")
+check("STREAM" in seq and "CLIMB" in seq, "streams then climbs")
+check(seq.index("STREAM") < seq.index("CLIMB") < seq.index("MISSION"),
+      "STREAM before CLIMB before MISSION")
 check("LAND" in seq and "DISARM" in seq and seq[-1] == "DONE",
       "lands, disarms, ends in DONE")
 check("HOLD" not in seq, "no HOLD in the nominal run")
@@ -458,7 +452,7 @@ def stubborn(name):
 
 
 HARNESS.proxy = stubborn
-n3.srv_mode = stubborn("mavros/set_mode")
+n3.set_mode = stubborn("mavros/set_mode")
 rospy.is_shutdown = lambda: Clock.t > 10.0
 n3.start_req = True
 n3.run()
@@ -510,7 +504,7 @@ n6.fence_r = 0.5
 rospy.is_shutdown = lambda: Clock.t > 40.0
 n6.run()
 check(n6.state == "HOLD", "ends in HOLD (state=%s)" % n6.state)
-check(logged("FENCE"), "said FENCE")
+check(logged("geofence"), "said geofence")
 
 print("\nNON-FINITE SETPOINT IS DROPPED")
 HARNESS.reset()
@@ -568,25 +562,15 @@ check(n8.state == "HOLD", "ends in HOLD (state=%s)" % n8.state)
 check(HARNESS.armed, "still armed -- did NOT disarm in the air")
 check(logged("no touchdown"), "said no touchdown")
 
-print("\nVELOCITY LANDING (path_generation.py's profile) still lands")
-HARNESS.reset()
-n9 = mission_node.MissionNode(); HARNESS.node = n9
-n9.start_req = True
-n9.land_mode = "velocity"
-rospy.is_shutdown = lambda: Clock.t > 90.0
-n9.run()
-check(n9.state == "DONE", "ends in DONE (state=%s)" % n9.state)
-check(not HARNESS.armed, "disarmed")
-
-print("\nHOVER HANDS THE ALTITUDE OVER TO THE PLANNER")
+print("\nTHE CLIMB TARGET COMES FROM THE PLANNER, NOT ~takeoff_height")
 HARNESS.reset()
 n10 = mission_node.MissionNode(); HARNESS.node = n10
 n10.start_req = True
 rospy.is_shutdown = lambda: Clock.t > 90.0
 n10.run()
-check(abs(n10.hover_z - HARNESS.planner_z) < 0.05,
-      "hover_z %.3f slewed onto the planner's %.2f" % (n10.hover_z,
-                                                       HARNESS.planner_z))
+check(abs(n10.z_want - HARNESS.planner_z) < 1e-6,
+      "z_want %.3f taken from the planner's %.2f (not 1.00)"
+      % (n10.z_want, HARNESS.planner_z))
 
 print("\n%d/%d checks passed" % (CHECKS[1], CHECKS[0]))
 sys.exit(0 if CHECKS[1] == CHECKS[0] else 1)

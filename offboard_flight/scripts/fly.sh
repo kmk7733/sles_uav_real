@@ -30,10 +30,31 @@ NS=rogx2
 SCRIPTS=/home/rogx/catkin_ws/src/offboard_flight/scripts
 SRV=/${NS}/mission_node
 
-# Same planner settings the mapping runs were measured with. _dry_run:=false is
-# the ONLY difference from ~/.restart_planner_dry.sh, and it is the difference
-# that makes the vehicle move.
-PLANNER_ARGS=${PLANNER_ARGS:-"_use_geodesic:=true _r_perc:=0.10 _viz_rollouts:=30"}
+# EVERY WEIGHT HERE IS config.yaml's, from the simulator this planner was
+# validated in. The node's own defaults are NOT all the same, so the ones that
+# differ are passed explicitly rather than left to drift:
+#
+#   _r_perc 0.10       node default 0.18;  config.yaml safety.r_perc = 0.10
+#   _use_geodesic true node default false; config.yaml mppi.use_geodesic = true
+#   _w_frontier 5.0    node default 0.0;   config.yaml mppi.w_frontier = 5.0
+#   _d_influence 0.60  node default null -> r_safe+0.35 = 0.86;
+#                      config.yaml mppi.d_influence = 0.60
+#
+# w_frontier was 0 only during a retune done against a GROUND-TRUTH map, where
+# the one term that rewards revealing space cannot help and measures as dead
+# weight. This vehicle flies a belief map, which is the case it exists for:
+# 11/12 val episodes reached at 5 against 10/12 at 0, and mean d_goal 0.22 m
+# against 0.54. It was tuned together with w_obs 20 and d_influence 0.60, so
+# those two travel with it.
+#
+# STILL DIVERGENT ON PURPOSE, both with measurements in the node: R_dnu = 0
+# (config.yaml has [1, 1, 0.2]) and horizon = 20 (config.yaml has 30). Both
+# were measured against THIS vehicle's envelope, which is not the simulator's
+# -- v_max 1.0 against 0.35, so sigma is 1.2 against 0.306 and the slew term
+# bills roughly 16x more here. Restoring either without first matching the
+# limits would reproduce a failure that is already written down.
+PLANNER_ARGS=${PLANNER_ARGS:-"_use_geodesic:=true _r_perc:=0.10 \
+    _w_frontier:=5.0 _d_influence:=0.60 _viz_rollouts:=30"}
 GOAL_X=${GOAL_X:-2.0}
 GOAL_Y=${GOAL_Y:-0.0}
 MISSION_ARGS=${MISSION_ARGS:-""}
