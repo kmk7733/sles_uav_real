@@ -88,7 +88,18 @@ SRV=/${NS}/mission_node
 # solve, since the map changes far slower than the plan does. That is a change
 # to planner/haa/cost.py, byte-identical to the simulator's copy by invariant,
 # so it belongs there first and not here.
-PLANNER_ARGS=${PLANNER_ARGS:-"_plan_rate:=10 _num_samples:=96 _use_geodesic:=false"}
+# BACK TO config.yaml's PLANNER. Performance first: K=192 with the geodesic,
+# horizon 30, everything the simulator's results were produced with, and only
+# the RATE conceded to the hardware. The 10 Hz column above bought its rate by
+# deleting the geodesic, which is the planner's only defence against the local
+# minima of ||p - goal|| -- too much to pay for a number.
+#
+#   here (5 Hz)   p50 119  p95 154   against a 200 ms budget: 60% / 77%
+#   10 Hz best    p50  70  p95 134   against 100 ms, geodesic OFF
+#
+# Replanning DISTANCE is what matters and 5 Hz at v_max 0.31 m/s is 6.2 cm per
+# cycle against a 3.0 s / 0.93 m horizon.
+PLANNER_ARGS=${PLANNER_ARGS:-"_plan_rate:=5"}
 GOAL_X=${GOAL_X:-2.0}
 GOAL_Y=${GOAL_Y:-0.0}
 MISSION_ARGS=${MISSION_ARGS:-""}
