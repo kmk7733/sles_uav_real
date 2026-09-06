@@ -30,17 +30,23 @@ written on paper.
 ## 2 · Bring up the stack
 
 ```bash
-~/catkin_ws/src/perception/restart_stack.sh
+~/catkin_ws/src/perception/restart_stack.sh          # no Foxglove
+FOXGLOVE=1 ~/catkin_ws/src/perception/restart_stack.sh   # watch it live
 ```
 
-roscore, MAVROS, ZED, Vicon, foxglove, the Andert mapper and a dry-run
-planner. Takes about 50 s.
+roscore, MAVROS, ZED, Vicon, the Andert mapper and a dry-run planner. ~50 s.
 
-For the real run, without the visualisation that costs measurable time:
+**Foxglove is off by default and that is a measurement, not a preference.**
+`foxglove_nodelet_manager` is 27.3% of a core, and the same planner measures
+p50 119 ms with it running against 70 ms without — about 40% of the plan
+budget to watch. It also decides what the planner computes: `~rollouts`,
+`~inflated` and `~inflated_outer` skip their work whenever nobody subscribes,
+so with no bridge they cost nothing whatever their parameters say.
 
-```bash
-FOXGLOVE=0 VIZ=0 ~/catkin_ws/src/perception/restart_stack.sh
-```
+`VIZ` is a different switch and a much smaller one — it only controls the
+mapper's FOV wedge, which gates on subscribers like everything else, so with
+the bridge off `VIZ=0` and `VIZ=1` do the same thing. Left at 1 so that
+`FOXGLOVE=1` shows the whole picture.
 
 ## 3 · Health check
 
