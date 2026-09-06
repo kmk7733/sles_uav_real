@@ -1,0 +1,202 @@
+# Flight checklist
+
+The order to run things in for an MPPI flight, and what each step has to say
+before you go on to the next. Nothing arms until step 7.
+
+Everything below lives in `offboard_flight/scripts/` unless the path says
+otherwise. `~/start_test_grid.sh` and `~/script_startup_flight.sh` are host
+scripts and sit outside this repo.
+
+```
+SCRIPTS=~/catkin_ws/src/offboard_flight/scripts
+```
+
+---
+
+## 1 · Vicon on, before anything else
+
+Power the Vicon system and confirm **ROGX2 is visible in Tracker**.
+
+This is first because `vicon_bridge` opens a blocking SDK connection: started
+against a host that is switched off it sits in a TCP connect for over 107 s
+without completing a single retry. If you get the order wrong, restart just
+the bridge with `~/script_startup_flight.sh vicon`.
+
+While you are in Tracker: **are the obstacles subjects?** If they are, step 8
+records their ground truth automatically. If they are not, the bag will hold
+the aircraft only and you will be measuring clearance against positions
+written on paper.
+
+## 2 · Bring up the stack
+
+```bash
+~/catkin_ws/src/perception/restart_stack.sh
+```
+
+roscore, MAVROS, ZED, Vicon, foxglove, the Andert mapper and a dry-run
+planner. Takes about 50 s.
+
+For the real run, without the visualisation that costs measurable time:
+
+```bash
+FOXGLOVE=0 VIZ=0 ~/catkin_ws/src/perception/restart_stack.sh
+```
+
+## 3 · Health check
+
+```bash
+~/start_test_grid.sh check
+```
+
+Wanted: **FCU connected `True`** and **Vicon streaming `yes`**. Stop here if
+either is missing.
+
+> If this says the FCU is down, check the timeout before you check the wiring.
+> It asks with `rostopic echo -n1` and every invocation pays a node
+> registration first; against `/mavros/state` at 1 Hz a short budget loses that
+> race on a healthy link. It is 12 s now — measured, 3 s reported NO DATA on a
+> link that answered at 12.
+
+## 4 · The three numbers that decide whether you fly
+
+```bash
+rostopic hz /grid_map                                  # ~7 Hz
+grep -a "world->FCU" /tmp/planner_dry.log | tail -1    # n >= 10, not NOT READY
+rostopic echo -n3 /rogx2/planar_planner_node/status    # valid=, solve=
+```
+
+| | expected | if not |
+|---|---|---|
+| `/grid_map` | ~7 Hz | the mapper is behind; check `~/gridmap_output.log` |
+| `world->FCU` | `t=[...] n>=10` | the planner will publish NO setpoints and the mission node will never arm. Both `/robot/pose_world` and `mavros/local_position/pose` must be live, with stamps inside 0.3 s of each other |
+| `valid=` | 130–150 / 192 | below ~40 the map is mostly unknown; look at `~inflated` in Foxglove |
+| `solve=` | 130–260 ms | see below |
+
+`solve` is measured against a 100 ms tick budget, so it does not fit at
+`plan_rate` 10 and `fly.sh` already defaults to **`_plan_rate:=5`**. If solves
+are consistently above ~350 ms, drop it further:
+`PLANNER_ARGS="_plan_rate:=4" $SCRIPTS/fly.sh`.
+
+Rate is not the thing to protect — replanning *distance* is. At v_max 0.31 m/s,
+5 Hz is 6.2 cm of travel per cycle against a 3.0 s / 0.93 m horizon, finer than
+the old 10 Hz at v_max 1.0, which was 10 cm.
+
+## 5 · Planner live, mission node up, recording on
+
+```bash
+$SCRIPTS/fly.sh
+```
+
+Runs the pre-flight, replaces the dry-run planner with a live one, starts the
+mission node, **starts the bag**, and then stops. It refuses to go on if any of
+the four pre-flight topics is missing.
+
+```bash
+RECORD=depth $SCRIPTS/fly.sh     # + compressedDepth, to re-run the mapper offline
+RECORD=0     $SCRIPTS/fly.sh     # no bag
+```
+
+Wait for this line before continuing:
+
+```
+[mission] READY -- rosservice call /rogx2/mission_node/start
+```
+
+## 6 · RC in hand
+
+- Transmitter on, **Position mode**, kill switch located.
+- Foxglove: `/grid_map`, `nominal_path`, `rollouts`, goal marker, the 0.31 m
+  footprint circle.
+- Confirm the goal marker is where you expect: **(2.0, 0.0)**.
+
+## 7 · Fly
+
+```bash
+$SCRIPTS/fly.sh go
+```
+
+Three-second countdown, then `~start`. From here it is automatic:
+
+| state | what it does | leaves when |
+|---|---|---|
+| `STREAM` | streams the current position, requests OFFBOARD then ARM | `/mavros/state` reports armed **and** OFFBOARD |
+| `CLIMB` | ramps to the planner's altitude at 0.3 m/s | within 0.15 m for 3 s, planner alive |
+| `MISSION` | forwards the planner's setpoints | `/goal_arrive_tf` true for 1 s |
+| `LAND` | descends at 0.4 m/s, x/y frozen | touchdown confirmed from `extended_state` |
+| `DISARM` | requests disarm at 2 Hz | `/mavros/state` reports disarmed |
+
+## 8 · Watching, and getting out
+
+```bash
+$SCRIPTS/fly.sh state      # mission state, mav mode, arrived flag, bag path
+$SCRIPTS/fly.sh land       # land now, from wherever it is
+$SCRIPTS/fly.sh stop       # close the bag, stop both nodes
+```
+
+**The RC always wins.** Switching out of OFFBOARD puts the mission node in
+`PILOT`: it stops publishing and does not resume on its own, even if OFFBOARD
+comes back. To fly again, go back to step 5.
+
+Failure sinks, none of which land the aircraft by themselves — they freeze it
+and hand you the decision:
+
+| `HOLD` because | why it stopped |
+|---|---|
+| planner silent > 0.5 s | no setpoints to forward |
+| non-finite setpoint | refused, never passed to PX4 |
+| geofence | > 6 m from where it armed |
+| `mission_timeout` | 120 s without reaching the goal |
+| landing did not confirm | no touchdown after the nominal descent + 10 s. **It does not disarm.** Take it with the RC |
+
+Logs: `/tmp/planner_live.log`, `/tmp/mission.log`, `/tmp/record.log`.
+
+---
+
+## After the flight
+
+```bash
+ls -lh ~/bags/                         # flight_<date>_<profile>.bag
+rosbag info ~/bags/flight_*.bag
+```
+
+What is in it and why:
+
+| group | topics |
+|---|---|
+| ground truth | `/vicon/.*` (**every** subject, obstacles included), `/robot/pose_world` |
+| perception | `/grid_map`, `~inflated`, `~inflated_outer` |
+| decision | `~config`, `~status`, `~nominal_path`, `~rollouts`, `~goal_marker`, `/goal_arrive_tf` |
+| execution | `commander/set_pose`, `setpoint_raw/local`, `setpoint_raw/target_local`, `local_position/pose`, `velocity_local`, `imu/data`, `battery` |
+| state machine | `mission_node/state`, `mavros/state`, `mavros/extended_state`, `/rosout_agg` |
+
+`~config` is the one to read first. It is latched JSON and says which producer
+flew (`haa` / `hpa` / `desimplex`), its class, the full limits, the derived
+sigma, every cost weight, the safety radii, the goal, and the git SHA of the
+tree `planner/` was imported from — plus whether that tree was dirty:
+
+```bash
+python3 - <<'PY'
+import json, rosbag
+b = rosbag.Bag('/home/rogx/bags/flight_XXXX.bag')
+for _, m, _ in b.read_messages('/rogx2/planar_planner_node/config'):
+    print(json.dumps(json.loads(m.data), indent=2)); break
+PY
+```
+
+`~inflated` is worth as much as `/grid_map`. The raw grid shows neither the
+unknown-is-unsafe rule nor the r_safe growth, so a path that looks needlessly
+timid against it is usually hugging the inflated set instead.
+
+---
+
+## Not yet exercised
+
+Honest list, so nothing here is a surprise in the air:
+
+- **`/goal_arrive_tf` has never fired.** If it does not, `MISSION` ends in
+  `HOLD` at `mission_timeout` — it will not descend. Land with `fly.sh land`.
+- **`FOXGLOVE=0` has not been run end to end.**
+- **`RC_MAP_KILL_SW` has not been confirmed on the ground.** Do this before
+  the first arm of the day.
+- **Solve time above is measured with the visualisation running.** It should
+  only improve with `FOXGLOVE=0 VIZ=0`, but that has not been measured.
