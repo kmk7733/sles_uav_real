@@ -838,8 +838,15 @@ class PlanarPlannerNode(object):
                      "dt": self.dt, "temperature": self.planner.temperature,
                      "goal_tol": self.planner.goal_tol,
                      "cap_velocity": self.cap_velocity,
+                     "seed": int(rospy.get_param("~seed", 0)),
                      "use_geodesic": self.use_geodesic,
-                     "w_frontier": self.w_frontier},
+                     "w_frontier": self.w_frontier,
+                     # The frontier term's two costs. Left out of the first
+                     # version of this blob, which made a w_frontier sweep
+                     # unattributable: the weight was recorded but not what
+                     # it scaled.
+                     "c_occupied": rospy.get_param("~c_occupied", 2.0),
+                     "c_unknown": rospy.get_param("~c_unknown", -4.0)},
             "weights": {"w_goal": weights.w_goal,
                         "w_term_pos": weights.w_term_pos,
                         "w_term_vel": weights.w_term_vel,
