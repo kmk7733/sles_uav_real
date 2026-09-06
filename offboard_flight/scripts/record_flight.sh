@@ -47,6 +47,12 @@ PROFILE=${1:-light}
 [ "$PROFILE" = "--list" ] && LIST=1 && PROFILE=${2:-light}
 
 # --- ground truth: EVERY Vicon subject, obstacles included -------------------
+# The regex also catches /vicon/markers, and that matters more than it looks.
+# vicon_bridge publishes marker data ONLY while something is subscribed, so
+# recording it is what turns it on -- and it is what lets analyze_flight.py
+# derive each obstacle's footprint from its corner markers instead of being
+# told the dimensions. Note the units differ from the segment transforms:
+# markers come through in millimetres, straight from the SDK.
 REGEX="/vicon/.*"
 
 TOPICS="

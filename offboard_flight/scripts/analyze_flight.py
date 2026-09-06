@@ -30,18 +30,26 @@ import numpy as np
 import rosbag
 
 TEMPLATE = """\
-# Obstacle geometry, in the Vicon world frame. Names are Vicon SUBJECT names,
-# so /vicon/pillar1/pillar1 is `pillar1`. Sizes are the PHYSICAL extent; the
-# analysis subtracts them from the centre distance to get surface clearance.
+# OVERRIDE ONLY. You should not normally need this file: if /vicon/markers is
+# in the bag, the footprint is DERIVED from the marker positions -- they are
+# stuck to the obstacles' corners, so their convex hull is the footprint --
+# and anything written here wins over that measurement.
 #
-#   disc:  radius [m]                      -- pillars
-#   box:   sx, sy [m], rotated by the subject's own Vicon yaw   -- walls
+# Names are Vicon SUBJECT names, so /vicon/pillar1/pillar1 is `pillar1`.
+#   disc:  radius [m]
+#   box:   sx, sy [m], rotated by the subject's own Vicon yaw
 #
-# MEASURE THESE. A guessed radius makes the clearance number wrong in the
-# direction that matters.
-pillar1: {shape: disc, radius: 0.15}
-pillar2: {shape: disc, radius: 0.15}
-wall1:   {shape: box,  sx: 2.00, sy: 0.10}
+# AND A BOX HERE IS PROBABLY WRONG. `box` is axis-aligned in the SUBJECT's
+# frame, and an object is not necessarily square to its own frame: pillar1's
+# 6 in square measures 27.6 deg rotated inside its subject frame, where an
+# axis-aligned box would have to be 0.226 x 0.202 m to contain a 0.152 m
+# pillar. The marker hull has no such problem, because it measures where the
+# corners actually are. Prefer it; use `disc` here if you must override.
+#
+# Nominal sizes, for reference: pillars are 6 x 6 in = 0.1524 x 0.1524 m,
+# walls 6 x 72 in = 0.1524 x 1.8288 m.
+pillar1: {shape: disc, radius: 0.1078}
+wall1:   {shape: box, sx: 1.8288, sy: 0.1524}
 """
 
 # Vicon runs at 100+ Hz, so a gap shorter than this is a timestamp artefact
@@ -54,11 +62,103 @@ T_STATUS = "/%s/planar_planner_node/status" % NS
 T_CONFIG = "/%s/planar_planner_node/config" % NS
 T_ARRIVE = "/goal_arrive_tf"
 T_WORLD = "/robot/pose_world"
+T_MARKERS = "/vicon/markers"
 
 
 def yaw_of(q):
     return math.atan2(2.0 * (q.w * q.z + q.x * q.y),
                       1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+
+def hull(pts):
+    """Convex hull of 2D points, CCW. Monotone chain; no scipy needed."""
+    pts = sorted(map(tuple, pts))
+    if len(pts) < 3:
+        return np.array(pts)
+
+    def half(seq):
+        out = []
+        for q in seq:
+            while len(out) >= 2:
+                (ax, ay), (bx, by) = out[-2], out[-1]
+                if (bx - ax) * (q[1] - ay) - (by - ay) * (q[0] - ax) > 0:
+                    break
+                out.pop()
+            out.append(q)
+        return out
+
+    return np.array(half(pts)[:-1] + half(reversed(pts))[:-1])
+
+
+def poly_distance(p, poly):
+    """Distance from p to a convex polygon. Positive outside, negative in."""
+    n = len(poly)
+    if n < 3:
+        return float(np.min(np.linalg.norm(poly - p, axis=1)))
+    best, inside = float("inf"), True
+    for i in range(n):
+        a, b = poly[i], poly[(i + 1) % n]
+        e = b - a
+        L2 = float(e @ e)
+        t = 0.0 if L2 < 1e-12 else float(np.clip((p - a) @ e / L2, 0.0, 1.0))
+        best = min(best, float(np.linalg.norm(p - (a + t * e))))
+        if float(e[0] * (p[1] - a[1]) - e[1] * (p[0] - a[0])) < 0.0:
+            inside = False
+    return -best if inside else best
+
+
+def footprints_from_markers(bag_path, poses):
+    """Derive each subject's footprint polygon from its Vicon MARKERS.
+
+    The markers are stuck to the obstacles' corners, so their convex hull IS
+    the footprint -- there is nothing to measure by hand and nothing to guess.
+    It is also conservative in the right direction: a marker centre sits a
+    couple of millimetres OUTBOARD of the face it is stuck to (measured on
+    pillar1: mean corner spacing 0.1562 m against a nominal 6 in = 0.1524, so
+    1.9 mm per side), and clearance to the hull is therefore slightly smaller
+    than clearance to the real surface.
+
+    TWO TRAPS, both of which produced wrong answers before they were noticed:
+
+      UNITS. vicon_bridge divides the SEGMENT transform by 1000 but publishes
+      MARKER translations as the SDK gives them, in millimetres. The two live
+      in the same bag in different units.
+
+      THE FIRST FRAMES ARE OCCLUDED. The bridge calls EnableMarkerData() only
+      once something subscribes, and the frame already in flight when that
+      happens answers with occluded=True at (0,0,0). The subject pose is valid
+      throughout, so "is it tracked" is not the question. Occluded markers are
+      dropped here, which handles it.
+
+    Obstacles are static, so each marker is reduced to its MEDIAN position in
+    its subject's frame before the hull is taken.
+    """
+    per = defaultdict(lambda: defaultdict(list))     # subject -> marker -> pts
+    try:
+        b = rosbag.Bag(bag_path)
+        for _, msg, _ in b.read_messages(topics=[T_MARKERS]):
+            for mk in msg.markers:
+                if mk.occluded or not mk.subject_name:
+                    continue
+                per[mk.subject_name][mk.marker_name].append(
+                    (mk.translation.x / 1000.0, mk.translation.y / 1000.0))
+        b.close()
+    except Exception:
+        return {}
+
+    out = {}
+    for name, marks in per.items():
+        if name not in poses:
+            continue
+        ox, oy, oyaw = poses[name]
+        c, sn = math.cos(-oyaw), math.sin(-oyaw)
+        local = []
+        for pts in marks.values():
+            a = np.median(np.array(pts), axis=0) - np.array([ox, oy])
+            local.append((c * a[0] - sn * a[1], sn * a[0] + c * a[1]))
+        if len(local) >= 3:
+            out[name] = hull(np.array(local))
+    return out
 
 
 def surface_distance(p, obs_xy, obs_yaw, geom):
@@ -109,15 +209,21 @@ def main():
     info = bag.get_type_and_topic_info()[1]
     vicon = sorted(t for t in info if t.startswith("/vicon/"))
 
+    # BY TYPE, not by name. /vicon/markers is under the same prefix but is a
+    # vicon_bridge/Markers, not a subject pose, and treating it as one crashes
+    # on the first bag that has both -- which is every bag recorded from now on.
     veh_topic = "/vicon/%s/%s" % (args.vehicle, args.vehicle)
-    obs_topics = [t for t in vicon if t != veh_topic]
+    obs_topics = [t for t in vicon
+                  if t != veh_topic
+                  and info[t].msg_type == "geometry_msgs/TransformStamped"]
 
     # ------------------------------------------------------------- read once
     traj = []                       # (t, x, y, z) from Vicon, ground truth
     obs = defaultdict(list)         # name -> (t, x, y, yaw)
     states, status, arrive = [], [], []
     cfg = None
-    want = set([T_STATE, T_STATUS, T_CONFIG, T_ARRIVE] + vicon)
+    want = set([T_STATE, T_STATUS, T_CONFIG, T_ARRIVE, veh_topic]
+               + obs_topics)
     for topic, msg, t in bag.read_messages(topics=list(want)):
         # THE MESSAGE'S OWN STAMP, not the bag receipt time. Receipt times
         # bunch: several Vicon frames can land in the same millisecond while
@@ -233,32 +339,66 @@ def main():
         print("  no %s track, cannot measure" % veh_topic)
     else:
         a = np.array(traj)
+        poses = {}
+        for name in obs:
+            o = np.array(obs[name])
+            poses[name] = (float(np.median(o[:, 1])), float(np.median(o[:, 2])),
+                           float(np.median(o[:, 3])))
+        # Markers first: they measure the footprint instead of assuming it.
+        hulls = footprints_from_markers(args.bag, poses)
         worst = None
         known_any = False
         for name in sorted(obs):
             o = np.array(obs[name])
-            # obstacles are static; take the median pose and note any drift
-            ox, oy, oyaw = np.median(o[:, 1]), np.median(o[:, 2]), \
-                np.median(o[:, 3])
+            ox, oy, oyaw = poses[name]
             drift = float(np.max(np.hypot(o[:, 1] - ox, o[:, 2] - oy)))
             g = geom.get(name)
-            ds = [surface_distance((x, y), (ox, oy), oyaw, g)
-                  for _, x, y, _ in a]
-            d = np.array([v for v, _ in ds])
-            known = ds[0][1]
+            poly = hulls.get(name)
+            if poly is not None and g is None:
+                c, sn = math.cos(oyaw), math.sin(oyaw)
+                R = np.array([[c, -sn], [sn, c]])
+                world = poly @ R.T + np.array([ox, oy])
+                d = np.array([poly_distance(np.array([x, y]), world)
+                              for _, x, y, _ in a])
+                sides = [float(np.linalg.norm(poly[k] - poly[(k + 1) %
+                                                            len(poly)]))
+                         for k in range(len(poly))]
+                diam = max(float(np.linalg.norm(poly[k] - poly[l]))
+                           for k in range(len(poly))
+                           for l in range(k + 1, len(poly))) \
+                    if len(poly) > 1 else 0.0
+                # NOT an axis-aligned bounding box. pillar1's square sits 27.6
+                # deg rotated inside its own subject frame, where a bbox reads
+                # 0.226 x 0.202 m for a 0.152 m side -- a number that invites
+                # exactly the wrong conclusion. Sides and diameter do not
+                # depend on how the object happens to sit in its frame.
+                known, src = True, ("markers: %d corners, sides %s m, "
+                                    "%.3f m across"
+                                    % (len(poly),
+                                       "/".join("%.3f" % v for v in sides),
+                                       diam))
+            else:
+                ds = [surface_distance((x, y), (ox, oy), oyaw, g)
+                      for _, x, y, _ in a]
+                d = np.array([v for v, _ in ds])
+                known = ds[0][1]
+                src = "geometry file" if known else "centre"
             known_any |= known
             i = int(d.argmin())
             kind = "surface" if known else "CENTRE"
             print("  %-10s at (%6.2f, %6.2f)  min %s %.3f m  at t+%.1f s%s"
                   % (name, ox, oy, kind, d[i], a[i, 0] - a[0, 0],
                      "  [moved %.2f m]" % drift if drift > 0.05 else ""))
+            print("  %-10s   footprint from %s" % ("", src))
             if known and (worst is None or d[i] < worst[1]):
                 worst = (name, d[i])
 
         if not known_any:
-            print("\n  These are CENTRE-TO-CENTRE distances. Pass --geometry")
-            print("  to subtract the obstacles' extent and get real clearance")
-            print("  (%s --template > obstacles.yaml)." % sys.argv[0])
+            print("\n  CENTRE-TO-CENTRE distances -- no footprint was")
+            print("  recoverable. %s is not in this bag (it publishes only"
+                  % T_MARKERS)
+            print("  while something subscribes, so record it), and no")
+            print("  --geometry was given.")
         elif worst and cfg:
             r_safe = cfg["safety"]["r_safe"]
             r_quad = cfg["safety"]["r_quad"]

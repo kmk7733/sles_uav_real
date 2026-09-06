@@ -168,15 +168,25 @@ The clearance block is the one that has never been measured on hardware.
 had only ever been checked against the occupancy grid — which is the planner's
 *belief*. With the obstacles in Vicon it becomes a measurement.
 
-**Vicon gives a pose, not an extent.** Without geometry the tool reports
-centre-to-centre distance and labels it `CENTRE`; it will not invent a radius.
-Measure the obstacles once and keep the file:
+**You do not need to measure the obstacles.** `/vicon/markers` is recorded, the
+markers are stuck to the corners, so their convex hull *is* the footprint. The
+tool derives it and prints what it found:
 
-```bash
-$SCRIPTS/analyze_flight.py --template > ~/obstacles.yaml
-# then edit: pillar1: {shape: disc, radius: 0.15}
-#            wall1:   {shape: box,  sx: 2.00, sy: 0.10}
 ```
+pillar1    at ( -0.71,   0.20)  min surface 0.482 m  at t+10.2 s
+             footprint from markers: 4 corners, sides 0.164/0.154/0.155/0.156 m, 0.236 m across
+```
+
+Those sides against a nominal 6 in = 0.1524 m. Marker centres sit ~2 mm
+outboard of the face they are stuck to, so the hull is very slightly *inside*
+the true surface — conservative, which is the right direction for a clearance
+number.
+
+`--geometry` still overrides, but prefer not to. A `box` there is axis-aligned
+in the *subject's* frame, and an object need not be square to its own frame:
+pillar1's 6 in square measures **27.6° rotated** inside its subject frame,
+where an axis-aligned box would have to be 0.226 × 0.202 m to contain a
+0.152 m pillar. The marker hull has no such problem.
 
 How to read the verdict:
 
