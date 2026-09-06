@@ -91,6 +91,51 @@ from planner.haa.capped import CappedDynamics
 from planner.haa.cost import FrontierMPPI
 
 
+# planar_sim/config.py:65-67, and they have to stay the same three numbers.
+SIGMA_FRAC_A = 0.48        # of a_max:      clipping ceiling
+SIGMA_FRAC_ALPHA = 0.5     # of alpha_max:  clipping ceiling, yaw channel
+SIGMA_FRAC_V = 0.54        # of v_max/(dt*sqrt(N)):  rejection ceiling
+
+
+def _ceilings(lim, dt, horizon):
+    spread = float(dt) * np.sqrt(float(horizon))
+    return ((SIGMA_FRAC_A * lim.a_max, SIGMA_FRAC_V * lim.v_max / spread),
+            (SIGMA_FRAC_ALPHA * lim.alpha_max,
+             SIGMA_FRAC_V * lim.omega_max / spread))
+
+
+def mppi_sigma(lim, dt, horizon):
+    """Per-channel MPPI search width (ax, ay, alpha), the smaller ceiling.
+
+    Bounded from two directions at once, which is why it is derived rather
+    than configured:
+
+      CLIPPING (the input bound). Samples are clipped to a_max, so a width
+      near it piles the proposal onto the +-a_max corners and the weighted
+      average degenerates into a vote between bang-bang extremes.
+
+      REJECTION (the state bound). Integrating noise of scale sigma for N
+      steps of dt gives a velocity random walk of sigma*dt*sqrt(N), and the
+      validator rejects any node over v_max. Too wide and samples die before
+      they are ever scored -- which does not look like a tuning problem from
+      outside: the solver still returns WEIGHTED, from a handful of
+      survivors, and the vehicle simply crawls.
+
+    Only the second couples to the horizon, so it is the one a fixed sigma
+    silently gets wrong the moment N, dt or v_max moves.
+    """
+    (a_clip, a_rej), (w_clip, w_rej) = _ceilings(lim, dt, horizon)
+    a, w = min(a_clip, a_rej), min(w_clip, w_rej)
+    return (a, a, w)
+
+
+def sigma_binding(lim, dt, horizon):
+    """Which ceiling won, for the log. Rejection is the one to worry about."""
+    (a_clip, a_rej), (w_clip, w_rej) = _ceilings(lim, dt, horizon)
+    return "a:%s yaw:%s" % ("clip" if a_clip < a_rej else "reject",
+                            "clip" if w_clip < w_rej else "reject")
+
+
 class PlanarPlannerNode(object):
 
     def __init__(self):
@@ -128,11 +173,16 @@ class PlanarPlannerNode(object):
         # costs NO integration accuracy -- the planar double integrator is exact
         # under piecewise-constant acceleration -- but it wrecks the valid
         # fraction fastest, so it is the wrong lever here.
-        self.horizon = int(rospy.get_param("~horizon", 20))
+        # 30, which is config.yaml's. It was 20, from the table above -- and
+        # that table was measured at sigma 1.2, where a longer rollout walks
+        # four times further into the unsafe set per node and the valid
+        # fraction collapses. At the derived sigma the two are not the same
+        # experiment, so the reason for 20 went away with the envelope.
+        self.horizon = int(rospy.get_param("~horizon", 30))
         self.num_samples = int(rospy.get_param("~num_samples", 192))
 
         self.r_quad = rospy.get_param("~r_quad", 0.31)
-        self.r_perc = rospy.get_param("~r_perc", 0.18)
+        self.r_perc = rospy.get_param("~r_perc", 0.10)
         self.r_track = rospy.get_param("~r_track", 0.05)
         self.d_clr = rospy.get_param("~d_clr", 0.05)
         self.r_safe = safe_radius(self.r_quad, self.r_perc, self.r_track,
@@ -171,13 +221,36 @@ class PlanarPlannerNode(object):
         self.align_timeout = rospy.get_param("~align_timeout", 1.0)
 
         # --------------------------------------------------------- planner
+        # THE SIMULATOR'S `limits_flown`, NOT ITS `limits:` BLOCK.
+        # X_bar = X (-) Z (paper eq. 11): the solver plans against the physical
+        # envelope MINUS the tracking tube, so a tracking transient cannot push
+        # the true state past the bound the safety argument rests on. The
+        # vehicle keeps the untightened numbers; nothing here ever sees them.
+        #
+        #                 config.yaml limits:   (-) safety:   -> here
+        #   v_max               0.35             z_vel 0.04      0.31
+        #   omega_max           0.5236           z_omega 0.0349  0.4887
+        #   a_max               3.5 (a_max_eff)  a_reserve 0     3.5
+        #   alpha_max           3.85             alpha_reserve 0 3.85
+        #   j_max               5.5              --              5.5
+        #   tilt_max            35 deg           --              0.6109
+        #
+        # WAS 1.0 / 2.5 / 1.5 / 3.0 / 0.5236 / 8.0, which belonged to nothing:
+        # the simulator never flew that envelope, so every result it produced
+        # was about a vehicle three times slower in translation and yaw than
+        # the one this node was commanding. a_max RISES 2.5 -> 3.5 and that is
+        # not a loosening in practice -- it is a clipping bound the sampler
+        # comes nowhere near (mean |a| 0.383, 11% of it), while j_max FALLS
+        # 8.0 -> 5.5 and that is the bound that actually shapes the trajectory.
+        # tilt_max is not binding either way: a_max_eff = min(a_max,
+        # g tan(tilt)) picks 3.5 against g tan(35 deg) = 6.87.
         limits = PlanarLimits(
-            v_max=rospy.get_param("~v_max", 1.0),
-            a_max=rospy.get_param("~a_max", 2.5),
-            omega_max=rospy.get_param("~omega_max", 1.5),
-            alpha_max=rospy.get_param("~alpha_max", 3.0),
-            tilt_max=rospy.get_param("~tilt_max", 0.5236),
-            j_max=rospy.get_param("~j_max", 8.0))
+            v_max=rospy.get_param("~v_max", 0.31),
+            a_max=rospy.get_param("~a_max", 3.5),
+            omega_max=rospy.get_param("~omega_max", 0.4887),
+            alpha_max=rospy.get_param("~alpha_max", 3.85),
+            tilt_max=rospy.get_param("~tilt_max", 0.610865),
+            j_max=rospy.get_param("~j_max", 5.5))
 
         # INPUT-CHANGE COST, DEFAULTED OFF.
         # R_dnu penalises |nu_k - nu_{k-1}|^2. The intent is "do not thrash the
@@ -194,8 +267,16 @@ class PlanarPlannerNode(object):
         # Smoothness does not depend on this term: clip_inputs() already
         # projects onto |a_k - a_{k-1}| <= j_max*dt as a HARD constraint, so the
         # emitted plan is slew-feasible with R_dnu = 0.
-        R_a = float(rospy.get_param("~r_dnu_a", 0.0))
-        R_alpha = float(rospy.get_param("~r_dnu_alpha", 0.0))
+        # BACK ON, at config.yaml's [1.0, 1.0, 0.2]. It was 0 because of a
+        # measurement -- mean slew cost 27.6 per sample against goal terms of
+        # 6.6, the nominal collapsing, 40 closed-loop solves decaying from
+        # +0.27 m of progress to -0.13 m -- and that measurement was made at
+        # sigma 1.2. R_dnu bills |nu_k - nu_(k-1)|^2, so it scales with
+        # sigma^2: at the derived 0.3056 it costs (0.3056/1.2)^2 = 6.5% of
+        # what it cost then. The term was never wrong; the search width it was
+        # measured against was.
+        R_a = float(rospy.get_param("~r_dnu_a", 1.0))
+        R_alpha = float(rospy.get_param("~r_dnu_alpha", 0.2))
 
         weights = PlanarCostWeights(
             R_dnu=(R_a, R_a, R_alpha),
@@ -203,9 +284,10 @@ class PlanarPlannerNode(object):
             w_term_pos=rospy.get_param("~w_term_pos", 10.0),
             w_term_vel=rospy.get_param("~w_term_vel", 2.0),
             w_obs=rospy.get_param("~w_obs", 20.0),
-            # null/None -> PlanarCostWeights uses r_safe + 0.35, which is what
-            # the simulation was tuned with. Exposed so it can be swept.
-            d_influence=rospy.get_param("~d_influence", None),
+            # 0.60, config.yaml's. Passing null here would make it
+            # r_safe + 0.35 = 0.86 -- a derivation, never a tuned value, and
+            # 0.26 m wider than the one w_frontier and w_obs were swept against.
+            d_influence=rospy.get_param("~d_influence", 0.60),
             w_yaw=rospy.get_param("~w_yaw", 0.0),
             yaw_mode=rospy.get_param("~yaw_mode", "velocity"))
 
@@ -222,6 +304,26 @@ class PlanarPlannerNode(object):
         # throws away every sample that exceeds v_max rather than clipping it,
         # so the accepted pool is a different distribution from the one every
         # result in the simulator was produced with.
+        # SIGMA IS DERIVED, NOT CONFIGURED, and that is the whole point of
+        # having moved it here. It was three hardcoded numbers -- (1.2, 1.2,
+        # 1.5) -- which happened to be right for the OLD envelope and would
+        # have stayed at their old values while the limits above changed
+        # underneath them. Deriving it is what makes the alignment safe:
+        # `mppi_sigma` reads limits, dt and horizon, so any future change to
+        # any of the three carries the search width with it.
+        #
+        # Same formula and same constants as planar_sim/config.py:mppi_sigma.
+        # Overridable per channel for a sweep; null (the default) derives.
+        sigma = mppi_sigma(limits, self.dt, self.horizon)
+        sigma = tuple(float(rospy.get_param(k, v)) for k, v in
+                      zip(("~sigma_ax", "~sigma_ay", "~sigma_alpha"), sigma))
+        rospy.loginfo("[planar] sigma=(%.4f, %.4f, %.4f)  [%s]  "
+                      "v_max=%.2f a_max=%.2f omega_max=%.3f j_max=%.2f",
+                      sigma[0], sigma[1], sigma[2],
+                      sigma_binding(limits, self.dt, self.horizon),
+                      limits.v_max, limits.a_max, limits.omega_max,
+                      limits.j_max)
+
         self.cap_velocity = bool(rospy.get_param("~cap_velocity", True))
         dyn_cls = CappedDynamics if self.cap_velocity else PlanarDynamics
         self.dyn = dyn_cls(limits, dt=self.dt)
@@ -231,13 +333,18 @@ class PlanarPlannerNode(object):
         # correction returns 0.0, so the class IS PlanarMPPI in that setting --
         # which keeps an A/B on either feature a change of a weight rather than
         # a change of code path. Mirrors build_planner() in run_planar_sim.py.
-        # EUCLIDEAN BY DEFAULT. The geodesic field is rebuilt every solve
-        # (a Dijkstra over the traversable set) and measured ~+50% on the solve
-        # time here, which this vehicle does not have to spare. Turn it back on
-        # with _use_geodesic:=true when the map is open enough for the goal to
-        # sit behind something -- that is the case it exists for.
-        self.use_geodesic = bool(rospy.get_param("~use_geodesic", False))
-        self.w_frontier = float(rospy.get_param("~w_frontier", 0.0))
+        # GEODESIC AND w_frontier 5.0, both config.yaml's. The geodesic field
+        # is a Dijkstra over the traversable set rebuilt every solve, measured
+        # at 24.8 ms of an 86.7 ms tick here -- affordable, and it is what
+        # removes the local minima ||p - goal|| has when the goal sits behind
+        # something. w_frontier was 0 only during a retune done against a
+        # GROUND-TRUTH map, where the one term that rewards revealing space
+        # cannot help and therefore measures as dead weight; this vehicle flies
+        # a belief map. On the val split, 11/12 episodes reached at 5 against
+        # 10/12 at 0, mean d_goal 0.22 m against 0.54. Tuned together with
+        # w_obs 20 and d_influence 0.60, so the three travel together.
+        self.use_geodesic = bool(rospy.get_param("~use_geodesic", True))
+        self.w_frontier = float(rospy.get_param("~w_frontier", 5.0))
         self.planner = FrontierMPPI(
             self.dyn, self.validator, weights=weights,
             use_geodesic=self.use_geodesic,
@@ -245,9 +352,7 @@ class PlanarPlannerNode(object):
             c_occupied=rospy.get_param("~c_occupied", 2.0),
             c_unknown=rospy.get_param("~c_unknown", -4.0),
             horizon=self.horizon, num_samples=self.num_samples,
-            sigma=(rospy.get_param("~sigma_ax", 1.2),
-                   rospy.get_param("~sigma_ay", 1.2),
-                   rospy.get_param("~sigma_alpha", 1.5)),
+            sigma=sigma,
             temperature=rospy.get_param("~temperature", 1.0),
             seed=int(rospy.get_param("~seed", 0)),
             goal_tol=rospy.get_param("~goal_tol", 0.25))
