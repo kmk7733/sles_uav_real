@@ -63,6 +63,7 @@ T_CONFIG = "/%s/planar_planner_node/config" % NS
 T_ARRIVE = "/goal_arrive_tf"
 T_WORLD = "/robot/pose_world"
 T_MARKERS = "/vicon/markers"
+T_GRID = "/grid_map"
 
 
 def yaw_of(q):
@@ -416,6 +417,44 @@ def main():
             else:
                 print("  clear of r_safe %.2f, margin %.3f m"
                       % (r_safe, worst[1] - r_safe))
+
+    # ------------------------------------------------- the set the gate used
+    # REBUILT, not recorded. ~inflated used to be published every plan tick at
+    # 8.5 ms of the solve's own thread; it is a pure function of /grid_map and
+    # r_safe, both of which are here, so it costs nothing in flight and is
+    # exact after it.
+    print("\nWHAT THE VALIDATOR GATED ON  (rebuilt from /grid_map + r_safe)")
+    if cfg is None:
+        print("  needs ~config for r_safe")
+    else:
+        try:
+            from scipy.ndimage import distance_transform_edt
+            b = rosbag.Bag(args.bag)
+            last, n = None, 0
+            for _, m, _ in b.read_messages(topics=[T_GRID]):
+                last, n = m, n + 1
+            b.close()
+            if last is None:
+                raise RuntimeError("no %s in this bag" % T_GRID)
+            g = np.asarray(last.data, dtype=np.int16).reshape(
+                last.info.height, last.info.width)
+            occupied, unknown = g >= 50, g < 0
+            res_m = last.info.resolution
+            d = distance_transform_edt(~occupied, sampling=res_m)
+            r_safe = cfg["safety"]["r_safe"]
+            unsafe = (d < r_safe) | (unknown if cfg["safety"]["unknown_unsafe"]
+                                     else False)
+            cells = g.size
+            print("  final grid %dx%d @ %.3f m   (%d grids in the bag)"
+                  % (last.info.width, last.info.height, res_m, n))
+            print("  occupied %5.1f%%   unknown %5.1f%%   free %5.1f%%"
+                  % (100.0 * occupied.mean(), 100.0 * unknown.mean(),
+                     100.0 * (~occupied & ~unknown).mean()))
+            print("  UNSAFE after r_safe %.2f m and the unknown rule: %.1f%% "
+                  "of the arena" % (r_safe, 100.0 * unsafe.sum() / cells))
+            print("  -> %.1f%% flyable" % (100.0 * (~unsafe).sum() / cells))
+        except Exception as e:
+            print("  could not rebuild: %s" % e)
 
     # -------------------------------------------------------- planner health
     print("\nPLANNER")

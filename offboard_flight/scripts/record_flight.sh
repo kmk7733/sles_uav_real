@@ -17,13 +17,15 @@
 #   GROUND TRUTH   /vicon/* -- ALL subjects, by regex, not just the aircraft.
 #                  Obstacles are Vicon subjects too, and a bag that recorded
 #                  only ROGX2 cannot tell you how far from the box it passed.
-#   PERCEPTION     the grid the planner consumed, and the inflated set the
-#                  validator actually gated on -- /grid_map alone shows
-#                  neither the unknown-is-unsafe rule nor the r_safe growth,
-#                  so a path that looks timid against the raw grid is
-#                  usually hugging ~inflated instead.
-#   DECISION       the nominal path, the surviving rollouts, the per-tick
-#                  status line (valid fraction, beta, cost, solve ms) and
+#   PERCEPTION     /grid_map, the grid the planner consumed. NOT ~inflated:
+#                  the inflated set is a pure function of that grid and
+#                  r_safe, and r_safe is in ~config, so analyze_flight.py
+#                  rebuilds it exactly. Recording it would cost 8.5 ms of
+#                  every plan tick for something already implied -- and it is
+#                  SUBSCRIBING that costs it, since the planner skips that
+#                  work whenever nobody is listening.
+#   DECISION       the nominal path, the per-tick status line (valid
+#                  fraction, beta, cost, solve ms, viz ms) and
 #                  ~config, which says WHICH producer and under which limits,
 #                  weights and git SHA. The HAA, the learned HPA and the
 #                  DeSimplex supervisor are indistinguishable from their
@@ -61,13 +63,10 @@ TOPICS="
 /robot/pose_world
 
 /grid_map
-/${NS}/planar_planner_node/inflated
-/${NS}/planar_planner_node/inflated_outer
 
 /${NS}/planar_planner_node/config
 /${NS}/planar_planner_node/status
 /${NS}/planar_planner_node/nominal_path
-/${NS}/planar_planner_node/rollouts
 /${NS}/planar_planner_node/goal_marker
 /goal_arrive_tf
 

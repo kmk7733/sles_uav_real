@@ -215,7 +215,11 @@ class PlanarPlannerNode(object):
         self.max_step = rospy.get_param("~max_setpoint_step", 1.0)
         self.dry_run = rospy.get_param("~dry_run", False)
         self.viz_frame = rospy.get_param("~viz_frame", "vicon/world")
-        self.viz_rollouts = int(rospy.get_param("~viz_rollouts", 30))
+        # 0. The rollout cloud is 30 x 31 points rebuilt every tick, 2.6 ms,
+        # and it is a picture of the SEARCH. What the vehicle actually did is
+        # ~nominal_path, which costs 0.03 ms and stays on. Raise it to watch
+        # the sampler.
+        self.viz_rollouts = int(rospy.get_param("~viz_rollouts", 0))
 
         self.align = WorldToFcu(
             alpha=rospy.get_param("~align_alpha", 0.05),
@@ -407,6 +411,7 @@ class PlanarPlannerNode(object):
         self.pub_arrived = rospy.Publisher(self.arrived_topic, Bool,
                                            queue_size=1, latch=True)
         self.arrived = False
+        self._goal_sent = None
         self.pub_goal = rospy.Publisher("~goal_marker", Marker, queue_size=1,
                                         latch=True)
         # The unsafe set the validator actually uses -- occupied AND unknown AND
@@ -416,7 +421,15 @@ class PlanarPlannerNode(object):
         # against the raw grid is usually hugging this instead.
         self.pub_unsafe = rospy.Publisher("~inflated", OccupancyGrid,
                                           queue_size=1, latch=True)
-        self.publish_inflated = rospy.get_param("~publish_inflated", True)
+        # OFF. It is a POST-FLIGHT question, and it costs 8.5 ms of every plan
+        # tick (p95 22.8) on this box: a grid-wide distance_transform_edt plus
+        # two int8 rasters of 14976 cells, built INSIDE plan_once on the
+        # solve's own thread. Nothing is lost by not sending it -- the
+        # inflated set is a pure function of /grid_map and r_safe, both of
+        # which are in the bag, so analyze_flight.py reconstructs it exactly.
+        # Turn it on to watch live in Foxglove, and expect the plan rate to
+        # pay for it.
+        self.publish_inflated = rospy.get_param("~publish_inflated", False)
         # The r_quad half of r_safe, drawn as a separate ring so the two parts
         # of the safety radius are distinguishable instead of one blob.
         self.r_viz_expand = float(rospy.get_param("~r_viz_expand",
@@ -583,14 +596,26 @@ class PlanarPlannerNode(object):
         self.ref_t0 = rospy.get_time()
         self.a_prev = res.reference.a[0].copy()
 
+        # TIMED, because these run on the solve's own thread and a subscriber
+        # appearing -- a rosbag, a Foxglove panel -- is enough to switch them
+        # on. Without this in the status line, "the planner got slower when I
+        # started recording" is invisible.
+        t1 = rospy.get_time()
         self._publish_path(self.ref)
         self._publish_rollouts(res.X_viz)
         self._publish_goal(goal)
         self._publish_inflated(occ)
+        viz_ms = (rospy.get_time() - t1) * 1000.0
+
         self._publish_status(
-            "%s valid=%d/%d beta=%.3g cost=%.1f solve=%.0fms | %s %s"
+            "%s valid=%d/%d beta=%.3g cost=%.1f solve=%.0fms viz=%.0fms | %s %s"
             % (res.status, res.n_valid, res.n_samples, res.beta, res.cost,
-               solve_ms, self.align.describe(), res.reason))
+               solve_ms, viz_ms, self.align.describe(), res.reason))
+        if viz_ms > 0.15 * solve_ms and viz_ms > 5.0:
+            rospy.logwarn_throttle(
+                10.0, "[planar] visualisation is %.0f ms of a %.0f ms tick -- "
+                      "something subscribed to ~rollouts or ~inflated",
+                viz_ms, solve_ms + viz_ms)
 
         if solve_ms > 1000.0 / self.plan_rate:
             rospy.logwarn_throttle(
@@ -709,6 +734,12 @@ class PlanarPlannerNode(object):
         self.pub_viz.publish(arr)
 
     def _publish_goal(self, goal):
+        # LATCHED, so re-sending an unchanged goal every tick tells nobody
+        # anything -- a late subscriber gets the latched copy regardless.
+        g = (float(goal[0]), float(goal[1]))
+        if self._goal_sent == g:
+            return
+        self._goal_sent = g
         m = Marker()
         m.header.frame_id = self.viz_frame
         m.header.stamp = rospy.Time.now()
