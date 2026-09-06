@@ -39,7 +39,9 @@ reference published here has vz = az = 0: altitude is held by the low-level
 controller and was never a planning variable.
 """
 
+import json
 import os
+import subprocess
 import sys
 import threading
 
@@ -389,6 +391,15 @@ class PlanarPlannerNode(object):
         self.pub_path = rospy.Publisher("~nominal_path", Path, queue_size=1)
         self.pub_viz = rospy.Publisher("~rollouts", MarkerArray, queue_size=1)
         self.pub_status = rospy.Publisher("~status", String, queue_size=1)
+        # WHAT FLEW, latched, as JSON. A bag that does not say which producer
+        # made it, under which limits and weights, is not evaluable six months
+        # later -- and it is about to matter more, because the same node is
+        # meant to fly the HAA, the learned HPA and the DeSimplex supervisor
+        # and the three are indistinguishable from their setpoints alone.
+        # Latched, so a recorder that starts after the node still gets it.
+        self.pub_config = rospy.Publisher("~config", String, queue_size=1,
+                                          latch=True)
+        self.producer = rospy.get_param("~producer", "haa")
         # Latched so a subscriber that joins late still learns the current
         # answer instead of waiting for the next tick.
         self.arrived_topic = rospy.get_param("~arrived_topic",
@@ -413,6 +424,7 @@ class PlanarPlannerNode(object):
         self.pub_ring = rospy.Publisher("~inflated_outer", OccupancyGrid,
                                         queue_size=1)
 
+        self._publish_config(limits, sigma, weights, dyn_cls)
         rospy.loginfo("[planar] %s", self.planner.describe().replace("\n", "\n[planar] "))
         rospy.loginfo("[planar] r_safe=%.3f (r_Q %.2f + r_perc %.2f + "
                       "r_track %.2f + d_clr %.2f)", self.r_safe, self.r_quad,
@@ -799,6 +811,57 @@ class PlanarPlannerNode(object):
         g.info.origin.orientation.w = 1.0
         g.data = np.where(blocked, 100, -1).astype(np.int8).reshape(-1).tolist()
         self.pub_unsafe.publish(g)
+
+    def _publish_config(self, limits, sigma, weights, dyn_cls):
+        """One latched JSON blob describing everything that decides a solve."""
+        try:
+            sha = subprocess.check_output(
+                ["git", "-C", _SRC, "rev-parse", "--short", "HEAD"],
+                stderr=subprocess.DEVNULL).decode().strip()
+            dirty = bool(subprocess.check_output(
+                ["git", "-C", _SRC, "status", "--porcelain", "planner"],
+                stderr=subprocess.DEVNULL).strip())
+        except Exception:
+            sha, dirty = "unknown", None
+        cfg = {
+            # WHICH PLANNER. The one field a comparison run cannot do without.
+            "producer": self.producer,
+            "planner_class": type(self.planner).__name__,
+            "dynamics": dyn_cls.__name__,
+            "src": _SRC, "git": sha, "planner_dirty": dirty,
+            "limits": {"v_max": limits.v_max, "a_max": limits.a_max,
+                       "omega_max": limits.omega_max,
+                       "alpha_max": limits.alpha_max,
+                       "tilt_max": limits.tilt_max, "j_max": limits.j_max},
+            "sigma": list(sigma),
+            "mppi": {"horizon": self.horizon, "num_samples": self.num_samples,
+                     "dt": self.dt, "temperature": self.planner.temperature,
+                     "goal_tol": self.planner.goal_tol,
+                     "cap_velocity": self.cap_velocity,
+                     "use_geodesic": self.use_geodesic,
+                     "w_frontier": self.w_frontier},
+            "weights": {"w_goal": weights.w_goal,
+                        "w_term_pos": weights.w_term_pos,
+                        "w_term_vel": weights.w_term_vel,
+                        "w_obs": weights.w_obs,
+                        "d_influence": weights.d_influence,
+                        "R_dnu": list(weights.R_dnu),
+                        "w_yaw": weights.w_yaw,
+                        "yaw_mode": weights.yaw_mode},
+            "safety": {"r_quad": self.r_quad, "r_perc": self.r_perc,
+                       "r_track": self.r_track, "d_clr": self.d_clr,
+                       "r_safe": self.r_safe,
+                       "unknown_unsafe": self.unknown_unsafe},
+            "goal": [float(self.goal[0]), float(self.goal[1])],
+            "rates": {"plan_rate": self.plan_rate, "pub_rate": self.pub_rate,
+                      "plan_timeout": self.plan_timeout},
+            "z0": self.z0, "dry_run": self.dry_run,
+            "grid_topic": self.grid_topic, "pose_topic": self.pose_topic,
+        }
+        self.pub_config.publish(String(data=json.dumps(cfg, sort_keys=True)))
+        rospy.loginfo("[planar] producer=%s planner=%s git=%s%s",
+                      self.producer, type(self.planner).__name__, sha,
+                      " (planner/ DIRTY)" if dirty else "")
 
     def _publish_status(self, text):
         self.pub_status.publish(String(data=text))

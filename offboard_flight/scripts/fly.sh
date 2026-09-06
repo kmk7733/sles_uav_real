@@ -10,6 +10,11 @@
 #   ~/catkin_ws/src/offboard_flight/scripts/fly.sh state    where it is
 #   ~/catkin_ws/src/offboard_flight/scripts/fly.sh stop     kill both nodes
 #
+#   RECORD=0 fly.sh          do not start the bag (it is on by default -- a
+#                            flight you cannot look at afterwards is a flight
+#                            you have to fly again)
+#   RECORD=depth fly.sh      bag profile: light (default) | depth | full
+#
 # THE MAPPER IS NOT STARTED HERE. Run ~/catkin_ws/src/perception/restart_stack.sh
 # first (or `~/start_test_grid.sh vicon`) and confirm /grid_map is publishing;
 # this script only replaces the DRY-RUN planner with a live one and adds the
@@ -63,6 +68,9 @@ GOAL_X=${GOAL_X:-2.0}
 GOAL_Y=${GOAL_Y:-0.0}
 MISSION_ARGS=${MISSION_ARGS:-""}
 
+RECORD=${RECORD:-light}
+[ "$RECORD" = "1" ] && RECORD=light
+
 _kill_flight_nodes() {
     pkill -f planar_planner_node 2>/dev/null
     pkill -f setpoint_buffer     2>/dev/null
@@ -75,6 +83,8 @@ _kill_flight_nodes() {
 case "${1:-start}" in
 
 stop)
+    pkill -INT -f "rosbag record" 2>/dev/null && echo "bag closed"
+    sleep 2
     _kill_flight_nodes
     pgrep -f "mission_node.py" >/dev/null && echo "mission node STILL RUNNING" \
         || echo "stopped, params cleared"
@@ -106,6 +116,18 @@ start)
         $MISSION_ARGS > /tmp/mission.log 2>&1 &
     echo "mission  pid $!  -> /tmp/mission.log"
 
+    # Started here rather than left to the operator, and started BEFORE the
+    # arm, so the bag covers takeoff. ~config and mission_node/state are
+    # latched, so joining late still captures them -- but nothing else is.
+    if [ "$RECORD" != "0" ]; then
+        nohup "$SCRIPTS/record_flight.sh" "$RECORD" \
+            > /tmp/record.log 2>&1 &
+        sleep 2
+        grep -a "writing\|profile\|free" /tmp/record.log | sed "s/^/bag      /"
+    else
+        echo "bag      NOT RECORDING (RECORD=0)"
+    fi
+
     echo "waiting for the world->FCU alignment ..."
     sleep 25
     grep -a "world->FCU\|r_safe=0\|cost:" /tmp/planner_live.log | tail -3
@@ -133,6 +155,7 @@ state)
         | grep -E "^(armed|mode):" | tr '\n' ' '; echo
     printf "arrived  : "; timeout 3 rostopic echo -n1 /goal_arrive_tf 2>/dev/null \
         | sed -n 's/^data: //p'
+    printf "bag      : "; ls -t /home/rogx/bags/*.bag* 2>/dev/null | head -1
     echo "--- last mission log ---"
     grep -a "\[mission\]" /tmp/mission.log | tail -8
     ;;
