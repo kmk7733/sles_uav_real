@@ -1,0 +1,60 @@
+{
+  "protected_files": [
+    {
+      "path": "planner/supervisor.py",
+      "sha256": "d553ab0f629183b67128cf79f632d55765bca549c8e7eb50a1016d56dd43acf5",
+      "unchanged": true
+    },
+    {
+      "path": "planner/transition.py",
+      "sha256": "34deb41655370adf5623d48fb489f1cde9a5c92352e637b225ddbab10bc41e66",
+      "unchanged": true
+    },
+    {
+      "path": "hardware/ekf_state/offboard_flight/scripts/mission_node.py",
+      "sha256": "83a59fd11e900f5999e6acf4b57573fd3cd0793bf8a1539f5997d1f0193eff0c",
+      "unchanged": true
+    },
+    {
+      "path": "hardware/ekf_state/offboard_flight/scripts/guidance_library.py",
+      "sha256": "ec18bd2b2bf899773ece3508bc076a4cbcadf04efa7f66b66b544103b00668ec",
+      "unchanged": true
+    },
+    {
+      "path": "hardware/ekf_state/offboard_flight/scripts/fly.sh",
+      "sha256": "633673d811dc7cce5709973f3b30c76159f6958b818fc74f25b2b1b7504993eb",
+      "unchanged": true
+    },
+    {
+      "path": "hardware/ekf_state/offboard_flight/scripts/preflight.py",
+      "sha256": "e2bb7e8790657865abc4d5a9a0a5164ea9cb3c54d02edc40fa57022df9d6cd05",
+      "unchanged": true
+    },
+    {
+      "path": "hardware/ekf_state/offboard_flight/scripts/record_flight.sh",
+      "sha256": "1fc502c4c1c959f1f9c3cf4068895f1a471d51fd5609106d8e9a4552732349ac",
+      "unchanged": true
+    },
+    {
+      "path": "hardware/ekf_state/offboard_flight/scripts/planar_planner_node.py",
+      "sha256": "ee4eeb54e14ed4f0f94c2ff58de1f24e1e28461cd4dd62ca5a1d2b9f8aa2ac31",
+      "unchanged": true
+    },
+    {
+      "path": "hardware/ekf_state/data_collection/scripts/config.yaml",
+      "sha256": "2d93cbd04d30f5842cf7374716368fb2bd0be912205d22a21b6e7eadd031ca53",
+      "unchanged": true
+    },
+    {
+      "path": "hardware/ekf_state/data_collection/scripts/record_flight.py",
+      "sha256": "ae049a460188e6a6760d07584c48f67db52606091f638f48b3ecfa7b448b0b56",
+      "unchanged": true
+    },
+    {
+      "path": "hardware/ekf_state/scripts/start_test_grid.sh",
+      "sha256": "67bf5db5bb6974be2aeb345545a10077c8dda92adb5a3f0bb30d5d23a8f24abc",
+      "unchanged": true
+    }
+  ],
+  "all_unchanged": true
+}

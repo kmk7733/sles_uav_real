@@ -1,0 +1,144 @@
+{
+  "release": "collision-stop-20260922",
+  "remote_root": "/home/rogx/catkin_ws/src",
+  "files": [
+    {
+      "path": "planner/desimplex.py",
+      "sha256": "202255f869ce3608e68b32a91ce4bf3ba48f026246551bcde796347d58843450",
+      "previous_sha256": null,
+      "mode": 420
+    },
+    {
+      "path": "planner/trajectory_safety.py",
+      "sha256": "6084e5694e5f2336d6d548b166a0b109d969616b465c0f665af9cdccdfe85509",
+      "previous_sha256": null,
+      "mode": 420
+    },
+    {
+      "path": "offboard_flight/scripts/planar_producer_factory.py",
+      "sha256": "290da678b6ff8037ff8d634a2de7abeb56a2ecb75904a23457c372fa6100c555",
+      "previous_sha256": "a8c87cb096aae5e2174ff76c44127d099f40db5a52f8f8334e73daeb305317dc",
+      "mode": 420
+    },
+    {
+      "path": "offboard_flight/scripts/collision_stop_core.py",
+      "sha256": "12f6af515da1ac49e49feaf86bfe461af6801a42e15bb7a06d9b1e32b874fdff",
+      "previous_sha256": null,
+      "mode": 420
+    },
+    {
+      "path": "offboard_flight/scripts/collision_stop_guard.py",
+      "sha256": "b4946cf7f06e9c76625883b6f8717bd49d0f44bc48178b5961f814aa109a3c5f",
+      "previous_sha256": null,
+      "mode": 493
+    },
+    {
+      "path": "offboard_flight/scripts/mission_stop_contract.py",
+      "sha256": "5cab76dc7137263e806cbcbaf3ee2623c335367713043812e4d80302f9c0b84e",
+      "previous_sha256": null,
+      "mode": 420
+    },
+    {
+      "path": "offboard_flight/scripts/guarded_mission_node.py",
+      "sha256": "d6bfd7d47e43d15ccfd68cd7029aad91b04ce978c84df122285a56999488d452",
+      "previous_sha256": null,
+      "mode": 493
+    },
+    {
+      "path": "offboard_flight/scripts/guarded_mission.example.yaml",
+      "sha256": "e773f2afea4c770806836760f4e31baa585ac7cb5516badf56f4d53418a33fd7",
+      "previous_sha256": null,
+      "mode": 420
+    },
+    {
+      "path": "offboard_flight/README_COLLISION_STOP.md",
+      "sha256": "97571b19505e832fafd545ab6c1769ee5888fca6b7f61270476fcaadebb775f0",
+      "previous_sha256": null,
+      "mode": 420
+    },
+    {
+      "path": "hardware/collision_stop/README.md",
+      "sha256": "09d339cd46bb9836e166daf2ad8898210a038bea24ffc8125d7c0ff82fad7204",
+      "previous_sha256": null,
+      "mode": 420
+    },
+    {
+      "path": "hardware/collision_stop/collision_stop_profile.example.json",
+      "sha256": "2005b6170f7e6f9e9099acfe0d230bf696677ce12cd4f5de1783a7556879c5bf",
+      "previous_sha256": null,
+      "mode": 420
+    },
+    {
+      "path": "hardware/collision_stop/evidence/backups.json",
+      "sha256": "7062d1faed6d85cf840c08587a1d297dfa1467253557d5e572ddaca818c765f5",
+      "previous_sha256": null,
+      "mode": 420
+    },
+    {
+      "path": "hardware/collision_stop/evidence/local_preservation.json",
+      "sha256": "0e1d87eb535456c22e037b9f04c82a775b2fa101a3b67606f4e4a56c2fff8a37",
+      "previous_sha256": null,
+      "mode": 420
+    },
+    {
+      "path": "hardware/collision_stop/evidence/local_tests.txt",
+      "sha256": "ffa9d136cd7bd0dfb26ceb0e0647a9e9ac0783baf01f75c180fd68378bcc6f20",
+      "previous_sha256": null,
+      "mode": 420
+    },
+    {
+      "path": "hardware/hpa_integration/README.md",
+      "sha256": "ee4aff4abb91165d55c8554a25dcb79074a3a4c5d47b008e354defcd22b83377",
+      "previous_sha256": null,
+      "mode": 420
+    },
+    {
+      "path": "hardware/hpa_integration/TODOLIST.md",
+      "sha256": "47d10d99a5bc67820bd8dbb21834eae7c353e7e3befcd8a832840adea4cd5b58",
+      "previous_sha256": null,
+      "mode": 420
+    },
+    {
+      "path": "hardware/collision_stop/tests/test_collision_stop_core.py",
+      "sha256": "302d68ca1ffcc567977cc9d9c824da5c2ae66a9d6393094362428fe5b588d365",
+      "previous_sha256": null,
+      "mode": 420
+    },
+    {
+      "path": "hardware/collision_stop/tests/test_collision_stop_guard.py",
+      "sha256": "9a2ddfc264b5f0f9e9fa59f08e6776da70629b2adfa76612bacfa19c22483ba3",
+      "previous_sha256": null,
+      "mode": 493
+    },
+    {
+      "path": "hardware/collision_stop/tests/test_mission_stop_contract.py",
+      "sha256": "9e8bc93c5ed3b707910758d3371d5cfefcd04cf4d3a402b3a852a0302a2a575f",
+      "previous_sha256": null,
+      "mode": 420
+    },
+    {
+      "path": "hardware/collision_stop/tests/test_mission_stop_node.py",
+      "sha256": "f553dc97026c1fd61a1360083e3dfceebe0b765582d164ea55cd0bf10de2b6bf",
+      "previous_sha256": null,
+      "mode": 420
+    },
+    {
+      "path": "hardware/collision_stop/REPORT.md",
+      "sha256": "a743985ec4c75526c520a56af41c2bf38d0e23ccb039bdbe1aad11da804042a5",
+      "previous_sha256": null,
+      "mode": 420
+    },
+    {
+      "path": "hardware/collision_stop/evidence/rogx_tests.txt",
+      "sha256": "fd62c4ea6f3c8a2c9b02544506bfd05d2d6a3e15b1b5a0fbf3f9530ebea7aa5a",
+      "previous_sha256": null,
+      "mode": 420
+    },
+    {
+      "path": "hardware/collision_stop/evidence/deployment_check.txt",
+      "sha256": "18ccf103fcfe1fe042f5ea98f3f5e92c4432dd7f954db43df6cfbb1d72093522",
+      "previous_sha256": null,
+      "mode": 420
+    }
+  ]
+}

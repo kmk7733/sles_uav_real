@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "enabled": false,
+  "session_id": "REPLACE_WITH_NEW_SHARED_GUARD_AND_MISSION_SESSION_ID",
+  "mode": "shadow",
+  "vicon_frame_id": "REPLACE_WITH_OBSERVED_VICON_HEADER_FRAME",
+  "vehicle": {
+    "topic": "REPLACE_WITH_VICON_VEHICLE_TRANSFORM_TOPIC",
+    "center_offset_subject_m": [null, null, null],
+    "radius_m": null
+  },
+  "map_path": "/REPLACE_WITH_RECORDED_VICON_MAP/map.yaml",
+  "obstacle_topics": {"REPLACE_WITH_EACH_MAP_PILLAR_NAME": "REPLACE_WITH_VICON_TRANSFORM_TOPIC"},
+  "topics": {
+    "nominal": "commander/set_pose",
+    "safe": "commander/set_pose_safe",
+    "status": "commander/collision_stop_shadow_status",
+    "execution": "commander/collision_stop_execution"
+  },
+  "nominal": {
+    "coordinate_frame": 1,
+    "frame_id": "REPLACE_WITH_PX4_LOCAL_FRAME_ID",
+    "frame_policy": "epoch_tagged"
+  },
+  "limits": {
+    "rate_hz": null,
+    "vicon_max_age_s": null,
+    "max_future_s": null,
+    "execution_max_age_s": null,
+    "nominal_max_age_s": null,
+    "velocity_max_gap_s": null,
+    "max_subject_skew_s": null,
+    "max_vicon_speed_m_s": null,
+    "max_obstacle_yaw_rate_rad_s": null
+  },
+  "collision": {"horizon_s": null, "stop_margin_m": null},
+  "log_path": "/REPLACE_WITH_NEW_SESSION_LOG/collision_stop.jsonl"
+}

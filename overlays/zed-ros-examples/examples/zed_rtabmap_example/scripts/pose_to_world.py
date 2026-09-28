@@ -1,55 +1,80 @@
 #!/usr/bin/env python3
-"""
-Republish a PoseStamped into the world frame of the grid map.
+"""Express MAVROS EKF body pose in the shared, fixed planning world.
 
-Bridges the localization source (ZED pose in 'map', later mavros
-local_position) to consumers that expect poses in the same frame as
-/grid_map (e.g. mpc_node, which uses its pose topic verbatim). Uses TF, so
-it works through the static vicon/world->map latched by vicon_map_align.
-
-  ~pose_in   (geometry_msgs/PoseStamped)  source pose
-  ~pose_out  (geometry_msgs/PoseStamped)  same pose expressed in ~world_frame
+The input topic defines the local ENU contract: MAVROS headers may say odom
+or map, neither of which is the ZED tracking map. Alignment comes only from
+ekf_world_align; an old TF or ZED pose is never a fallback.
 """
+import threading
 
 import rospy
-import tf2_ros
-import tf2_geometry_msgs
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped
+from std_msgs.msg import String
+
+from ekf_alignment import SharedFrameAlignment
 
 
 class PoseToWorld:
     def __init__(self):
-        self.world_frame = rospy.get_param('~world_frame', 'vicon/world')
-        # tf2 rejects leading '/' in lookups; messages keep the name verbatim
-        self.world_frame_tf = self.world_frame.lstrip('/')
-        # override for sources with a wrong/empty frame_id (e.g. mavros also
-        # stamps 'map' but means the FCU ENU frame, not the ZED map frame)
-        self.pose_frame = rospy.get_param('~pose_frame', '')
-        self.buf = tf2_ros.Buffer()
-        tf2_ros.TransformListener(self.buf)
+        self.world_frame = rospy.get_param('~world_frame', 'plan_world').lstrip('/')
+        self.local_frame = rospy.get_param('~local_frame', 'fcu_local').lstrip('/')
+        self.alignment_max_age = float(rospy.get_param('~alignment_max_age', 0.5))
+        self.pose_max_age = float(rospy.get_param('~pose_max_age', 0.25))
+        self._lock = threading.RLock()
+        self.alignment = SharedFrameAlignment(self.world_frame, self.local_frame)
         self.pub = rospy.Publisher('~pose_out', PoseStamped, queue_size=10)
-        rospy.Subscriber('~pose_in', PoseStamped, self.cb, queue_size=10)
+        self.pub_epoch = rospy.Publisher(
+            rospy.get_param('~pose_epoch_out', '/robot/pose_world_epoch'),
+            TransformStamped, queue_size=10)
+        self.sub_alignment = rospy.Subscriber(
+            rospy.get_param('~alignment_topic', '/robot/frame_alignment'),
+            String, self.cb_alignment, queue_size=10)
+        self.sub_pose = rospy.Subscriber('~pose_in', PoseStamped, self.cb,
+                                         queue_size=10)
+
+    def cb_alignment(self, msg):
+        with self._lock:
+            self.alignment.update_status(msg.data, rospy.Time.now().to_sec())
 
     def cb(self, msg):
-        src = (self.pose_frame or msg.header.frame_id).lstrip('/')
-        if src == self.world_frame_tf:
-            msg.header.frame_id = self.world_frame
-            self.pub.publish(msg)
-            return
-        try:
-            # Time(0): the source->world chain is static after alignment
-            tfm = self.buf.lookup_transform(self.world_frame_tf, src,
-                                            rospy.Time(0), rospy.Duration(0.2))
-        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
-                tf2_ros.ExtrapolationException) as e:
-            rospy.logwarn_throttle(5.0, 'pose_to_world: no TF %s->%s (%s)',
-                                   src, self.world_frame, e)
-            return
-        msg.header.frame_id = src
-        out = tf2_geometry_msgs.do_transform_pose(msg, tfm)
-        out.header.stamp = msg.header.stamp
-        out.header.frame_id = self.world_frame
-        self.pub.publish(out)
+        now = rospy.Time.now().to_sec()
+        stamp = msg.header.stamp.to_sec()
+        with self._lock:
+            a = self.alignment
+            if not a.is_ready(now, self.alignment_max_age):
+                rospy.logwarn_throttle(5.0, 'pose_to_world: waiting for valid EKF alignment')
+                return
+            if (stamp <= 0.0 or stamp < a.valid_from or
+                    stamp > now + 0.05 or now - stamp > self.pose_max_age):
+                return
+            p, q = msg.pose.position, msg.pose.orientation
+            try:
+                xyz = a.local_to_world([p.x, p.y, p.z])
+                quat = a.orientation_to_world([q.x, q.y, q.z, q.w])
+            except ValueError as exc:
+                rospy.logwarn_throttle(5.0, 'pose_to_world: invalid EKF pose (%s)', exc)
+                return
+            out = PoseStamped()
+            out.header.stamp = msg.header.stamp
+            out.header.frame_id = self.world_frame
+            out.pose.position.x, out.pose.position.y, out.pose.position.z = xyz
+            (out.pose.orientation.x, out.pose.orientation.y,
+             out.pose.orientation.z, out.pose.orientation.w) = quat
+            tagged = TransformStamped()
+            tagged.header.stamp = msg.header.stamp
+            tagged.header.frame_id = self.world_frame
+            # This is a topic payload, NOT a TF broadcast. The child field
+            # makes pose+epoch atomic without changing /robot/pose_world or
+            # relying on Header.seq (which rospy overwrites at publication).
+            tagged.child_frame_id = 'ekf_body/epoch/' + a.epoch
+            (tagged.transform.translation.x, tagged.transform.translation.y,
+             tagged.transform.translation.z) = xyz
+            (tagged.transform.rotation.x, tagged.transform.rotation.y,
+             tagged.transform.rotation.z, tagged.transform.rotation.w) = quat
+            # Serialize validity/epoch changes with publication. The original
+            # measurement stamp and EKF roll/pitch are preserved.
+            self.pub_epoch.publish(tagged)
+            self.pub.publish(out)
 
 
 if __name__ == '__main__':

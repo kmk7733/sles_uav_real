@@ -52,6 +52,7 @@ Publishes:   ~grid_out  (nav_msgs/OccupancyGrid, in <world_frame>)
 import math
 import os
 import sys
+import threading
 import time
 
 import numpy as np
@@ -59,12 +60,13 @@ import rospy
 import tf2_ros
 from geometry_msgs.msg import Point
 from nav_msgs.msg import OccupancyGrid
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import TransformStamped
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 from tf2_msgs.msg import TFMessage
 from tf.transformations import quaternion_matrix
 from visualization_msgs.msg import Marker, MarkerArray
+from ekf_alignment import SharedFrameAlignment
 
 # `perception/` is a plain package under catkin_ws/src, reached the same way
 # `planner/` is -- no package.xml, nothing to build. Found by walking up rather
@@ -134,14 +136,13 @@ class DepthToGridAndert(object):
 
     def __init__(self):
         # ------------------------------------------------------------ frames
-        self.world_frame = rospy.get_param('~world_frame', 'map')
+        self.world_frame = rospy.get_param('~world_frame', 'plan_world')
         self.world_frame_tf = self.world_frame.lstrip('/')   # tf2 rejects '/'
         self.map_frame = rospy.get_param('~map_frame', 'map').lstrip('/')
         self.tf_timeout = float(rospy.get_param('~tf_timeout', 0.03))
         self.tf_max_age = float(rospy.get_param('~tf_max_age', 0.25))
-        # `vicon_map_align.py` computes world->map ONCE and re-broadcasts the
-        # same constant on /tf at 10 Hz. Latching it keeps a 10 Hz publisher off
-        # the critical path of a 15 Hz consumer without changing the answer.
+        # Legacy TF parameters are retained only for source compatibility;
+        # the EKF path below explicitly requires topic poses.
         self.latch_world_map = bool(rospy.get_param('~latch_world_map', True))
         self._M_wm = None
         # WHERE THE POSE COMES FROM, AND WHY IT IS NOT tf2 BY DEFAULT.
@@ -154,21 +155,32 @@ class DepthToGridAndert(object):
         # listener and 151 ms inside the node with it.
         #
         # Nothing it is being asked for needs a live listener:
-        #     vicon/world -> map     constant, latched once by vicon_map_align
-        #     map -> base_link       /robot/pose_world, 30 Hz, ALREADY in
-        #                            vicon/world (pose_to_world.py)
+        #     world -> body         /robot/pose_world_epoch, transformed EKF pose
         #     base_link -> optical   /tf_static, three latched messages
         # `perception/check_pose_source.py` compares the two paths against each
         # other: 60 samples agreed to 0.0000 m and 0.014 deg, and the static
         # chain it recovers is the mount transform `bag_grid_map` hard-codes.
         self.pose_source = str(rospy.get_param('~pose_source', 'topic'))
+        if self.pose_source != 'topic':
+            raise ValueError('EKF mapper requires ~pose_source:=topic; no ZED TF fallback')
         self.pose_topic = str(rospy.get_param('~pose_topic',
-                                              '/robot/pose_world'))
+                                              '/robot/pose_world_epoch'))
         self.pose_frame = str(rospy.get_param('~pose_frame',
                                               'base_link')).lstrip('/')
         self.pose_max_dt = float(rospy.get_param('~pose_max_dt', 0.05))
         self._T_bo = None          # pose_frame -> camera optical, static
         self._depth_frame = None
+        # Alignment callbacks can invalidate while fuse_frame is running.
+        # Work captures a grid object; invalidation replaces that object, so
+        # a late result can never mutate or publish the new epoch's evidence.
+        self._state_lock = threading.RLock()
+        self._pose_lock = self._state_lock
+        self.alignment_max_age = float(rospy.get_param('~alignment_max_age', 0.5))
+        self.alignment = SharedFrameAlignment(
+            self.world_frame_tf, rospy.get_param('~local_frame', 'fcu_local'))
+        self._alignment_ready = False
+        self._generation = 0
+        self.n_dropped_alignment = 0
         self._pose_t = []          # ring buffer of stamps
         self._pose_M = []          # and their 4x4 world <- pose_frame
         self.n_dropped_pose = 0
@@ -178,10 +190,10 @@ class DepthToGridAndert(object):
 
         # -------------------------------------------------------------- grid
         self.res = float(rospy.get_param('~resolution', 0.05))
-        self.min_x = float(rospy.get_param('~grid_min_x', -5.0))
-        self.max_x = float(rospy.get_param('~grid_max_x', 5.0))
-        self.min_y = float(rospy.get_param('~grid_min_y', -2.0))
-        self.max_y = float(rospy.get_param('~grid_max_y', 10.0))
+        self.min_x = float(rospy.get_param('~grid_min_x', -1.0))
+        self.max_x = float(rospy.get_param('~grid_max_x', 6.0))
+        self.min_y = float(rospy.get_param('~grid_min_y', -2.5))
+        self.max_y = float(rospy.get_param('~grid_max_y', 2.5))
         self.wall_enable = bool(rospy.get_param('~border_wall_enable', True))
         self.wall_t = float(rospy.get_param('~border_wall_thickness', 0.1))
 
@@ -223,10 +235,11 @@ class DepthToGridAndert(object):
         self.map_hz = float(rospy.get_param('~map_hz', 10.0))
         self.publish_every_n = max(1, int(rospy.get_param('~publish_every_n', 1)))
 
-        self.grid = AndertGrid(
-            nx, ny, self.res, self.min_x, self.min_y,
+        self._grid_args = (nx, ny, self.res, self.min_x, self.min_y)
+        self._grid_kwargs = dict(
             log_odds_clip=float(rospy.get_param('~log_odds_clip', 10.0)),
             p_occ=float(rospy.get_param('~p_occ', 0.5)))
+        self.grid = AndertGrid(*self._grid_args, **self._grid_kwargs)
 
         self._wall = None
         if self.wall_cells:
@@ -307,7 +320,7 @@ class DepthToGridAndert(object):
             self._static_links = {}
             self._sub_static = rospy.Subscriber('/tf_static', TFMessage,
                                                 self.cb_static, queue_size=50)
-            self.sub_pose = rospy.Subscriber(self.pose_topic, PoseStamped,
+            self.sub_pose = rospy.Subscriber(self.pose_topic, TransformStamped,
                                              self.cb_pose, queue_size=50)
         self.pub = rospy.Publisher('~grid_out', OccupancyGrid, queue_size=1)
         self.pub_wedge = rospy.Publisher('~wedge_out', Marker, queue_size=1)
@@ -316,6 +329,12 @@ class DepthToGridAndert(object):
         self.pub_seeded = rospy.Publisher('~seeded', Bool, queue_size=1,
                                           latch=True)
         self.pub_seeded.publish(Bool(data=False))
+
+        self.sub_alignment = rospy.Subscriber(
+            rospy.get_param('~alignment_topic', '/robot/frame_alignment'),
+            String, self.cb_alignment, queue_size=10)
+        self._alignment_timer = rospy.Timer(rospy.Duration(0.1),
+                                             self.check_alignment)
 
         self.sub_info = rospy.Subscriber('~info_in', CameraInfo, self.cb_info,
                                          queue_size=1)
@@ -338,6 +357,39 @@ class DepthToGridAndert(object):
             self.rays_per_col, self.map_hz, prov)
 
     # ------------------------------------------------------------ intrinsics
+
+    def _clear_epoch(self):
+        """Called under _state_lock; old fusion keeps only a discarded grid."""
+        self._generation += 1
+        self.grid = AndertGrid(*self._grid_args, **self._grid_kwargs)
+        if self._wall is not None:
+            self.grid.L[self._wall] = self.grid.l_clip
+            self.grid.assert_seen(self._wall)
+        self._pose_t.clear()
+        self._pose_M.clear()
+        self._pose_dt.clear()
+        self._last_base = None
+        self.clock = RateClock(self.map_hz)
+        self.pub_seeded.publish(Bool(data=False))
+
+    def _ready_locked(self, now):
+        ready = self.alignment.is_ready(now, self.alignment_max_age)
+        if self._alignment_ready and not ready:
+            self._clear_epoch()
+        self._alignment_ready = ready
+        return ready
+
+    def cb_alignment(self, msg):
+        with self._state_lock:
+            changed = self.alignment.update_status(msg.data, rospy.Time.now().to_sec())
+            if changed:
+                self._clear_epoch()
+                self._alignment_ready = False
+            self._ready_locked(rospy.Time.now().to_sec())
+
+    def check_alignment(self, _event):
+        with self._state_lock:
+            self._ready_locked(rospy.Time.now().to_sec())
 
     def cb_info(self, msg):
         """Build StereoParams from the camera's OWN calibration, once.
@@ -400,6 +452,10 @@ class DepthToGridAndert(object):
     # ------------------------------------------------------------------ pose
 
     def cb_static(self, msg):
+        with self._state_lock:
+            self._cb_static_locked(msg)
+
+    def _cb_static_locked(self, msg):
         """Collect /tf_static once and build pose_frame -> camera optical.
 
         A depth-first parent->child walk, not tf2: the ZED chain is a simple
@@ -419,6 +475,10 @@ class DepthToGridAndert(object):
         self._resolve_static()
 
     def _resolve_static(self):
+        with self._state_lock:
+            self._resolve_static_locked()
+
+    def _resolve_static_locked(self):
         target = self._depth_frame
         if target is None:
             return
@@ -438,21 +498,29 @@ class DepthToGridAndert(object):
                     stack.append((chi, M.dot(T)))
 
     def cb_pose(self, msg):
-        """Ring-buffer the vehicle pose, already in the world frame."""
+        """Buffer atomic world body pose + alignment epoch (not a TF topic)."""
         got = msg.header.frame_id.lstrip('/')
-        if got and got != self.world_frame_tf:
+        if got != self.world_frame_tf:
             rospy.logwarn_throttle(
                 10.0, "%s is stamped %r, not the map's %r -- the pose and the "
                 "grid are in different frames", self.pose_topic, got,
                 self.world_frame_tf)
-        p_, q_ = msg.pose.position, msg.pose.orientation
+            return
+        p_, q_ = msg.transform.translation, msg.transform.rotation
         M = quaternion_matrix([q_.x, q_.y, q_.z, q_.w])
         M[:3, 3] = [p_.x, p_.y, p_.z]
-        self._pose_t.append(msg.header.stamp.to_sec())
-        self._pose_M.append(M)
-        if len(self._pose_t) > 128:          # ~4 s at 30 Hz
-            del self._pose_t[:64]
-            del self._pose_M[:64]
+        if not np.isfinite(M).all():
+            return
+        with self._pose_lock:
+            if (not self._ready_locked(rospy.Time.now().to_sec()) or
+                    msg.child_frame_id != 'ekf_body/epoch/' + self.alignment.epoch or
+                    msg.header.stamp.to_sec() < self.alignment.valid_from):
+                return
+            self._pose_t.append(msg.header.stamp.to_sec())
+            self._pose_M.append(M)
+            if len(self._pose_t) > 128:          # ~4 s at 30 Hz
+                del self._pose_t[:64]
+                del self._pose_M[:64]
 
     def lookup_topic(self, stamp):
         """world <- camera optical, from the pose topic and the static chain.
@@ -463,19 +531,25 @@ class DepthToGridAndert(object):
         anything worse rather than fusing it, and the ages are reported so the
         assumption is on the record instead of assumed.
         """
-        if self._T_bo is None or not self._pose_t:
+        if self._T_bo is None:
             return None
         t = stamp.to_sec()
-        ts = np.asarray(self._pose_t)
-        i = int(np.argmin(np.abs(ts - t)))
+        # Pose and depth callbacks run on different threads. Keep the chosen
+        # stamp paired with its matrix while the ring buffer is trimmed.
+        with self._pose_lock:
+            if not self._pose_t:
+                return None
+            ts = np.asarray(self._pose_t)
+            i = int(np.argmin(np.abs(ts - t)))
+            M_pose = self._pose_M[i]
         dt = abs(ts[i] - t)
         if dt > self.pose_max_dt:
             rospy.logwarn_throttle(3.0, "nearest pose is %.0f ms from the "
                                    "frame; dropping", dt * 1e3)
             return None
         self._pose_dt.append(dt)
-        self._last_base = self._pose_M[i][:3, 3]
-        M = self._pose_M[i].dot(self._T_bo)
+        self._last_base = M_pose[:3, 3]
+        M = M_pose.dot(self._T_bo)
         return M[:3, 3], M[:3, :3]
 
     def lookup(self, frame, stamp):
@@ -519,6 +593,15 @@ class DepthToGridAndert(object):
         if self.stereo is None:
             return                              # camera_info not in yet
 
+        with self._state_lock:
+            if (not self._ready_locked(rospy.Time.now().to_sec()) or
+                    msg.header.stamp.to_sec() < self.alignment.valid_from):
+                self.n_dropped_alignment += 1
+                return
+            generation, epoch = self._generation, self.alignment.epoch
+            valid_from = self.alignment.valid_from
+            grid = self.grid
+
         if self.require_optical and not msg.header.frame_id.endswith(
                 "_optical_frame"):
             # optical vs non-optical is a silent 90 deg rotation: the map fills
@@ -542,18 +625,17 @@ class DepthToGridAndert(object):
             age = (rospy.Time.now() - msg.header.stamp).to_sec()
         except Exception:
             age = 0.0
-        if self.tf_max_age > 0.0 and age > self.tf_max_age:
+        if age < -0.05 or (self.tf_max_age > 0.0 and age > self.tf_max_age):
             # A backlog is better dropped than fused against a pose the buffer
             # had to reach for.
             self.n_dropped_stale += 1
             return
-        if not self.clock.due(t_msg):
-            self.n_dropped_rate += 1
-            return
-
-        if self.pose_source == 'tf':
-            pose = self.lookup(msg.header.frame_id, msg.header.stamp)
-        else:
+        with self._state_lock:
+            if generation != self._generation:
+                return
+            if not self.clock.due(t_msg):
+                self.n_dropped_rate += 1
+                return
             pose = self.lookup_topic(msg.header.stamp)
         if pose is None:
             self.n_dropped_tf += 1
@@ -574,31 +656,38 @@ class DepthToGridAndert(object):
             # the order stereo_from_camera_info divided the intrinsics in.
             depth = depth[::self.row_decim, ::self.decim]
 
-        if not self.grid.seeded:
-            self._maybe_seed(cam_xyz)
+        was_seeded = grid.seeded
+        if not was_seeded:
+            self._maybe_seed(cam_xyz, grid)
 
         t1 = time.time()
         fuse_frame(depth, cam_xyz, R_world_opt, self.stereo, self.profile,
-                   self.grid, self.plane_height, self.plane_tol,
+                   grid, self.plane_height, self.plane_tol,
                    rays_per_col=self.rays_per_col)
         t2 = time.time()
-        self.n_fused += 1
-
-        if self.n_fused % self.publish_every_n == 0:
-            self.publish(msg.header.stamp)
-            if self.publish_wedge:
-                self.publish_wedge_marker(msg.header.stamp, cam_xyz,
-                                          R_world_opt)
-            if self.publish_footprint:
-                self.publish_footprint_marker(msg.header.stamp, cam_xyz)
+        with self._state_lock:
+            if (not self._ready_locked(rospy.Time.now().to_sec()) or
+                    generation != self._generation or epoch != self.alignment.epoch):
+                self.n_dropped_alignment += 1
+                return
+            self.n_fused += 1
+            if not was_seeded and grid.seeded:
+                self.pub_seeded.publish(Bool(data=True))
+            if self.n_fused % self.publish_every_n == 0:
+                self.publish(msg.header.stamp, valid_from)
+                if self.publish_wedge:
+                    self.publish_wedge_marker(msg.header.stamp, cam_xyz,
+                                              R_world_opt)
+                if self.publish_footprint:
+                    self.publish_footprint_marker(msg.header.stamp, cam_xyz)
         t3 = time.time()
         self._ms.append(((t1 - t0) * 1e3, (t2 - t1) * 1e3, (t3 - t2) * 1e3))
         self._log(t_msg)
 
-    def _maybe_seed(self, cam_xyz):
+    def _maybe_seed(self, cam_xyz, grid):
         """Assert the free disc once. See the note in __init__."""
         if self.seed_radius <= 0.0:
-            self.grid.seeded = True
+            grid.seeded = True
             return
         if self.seed_pose is not None:
             cx, cy = self.seed_pose
@@ -611,18 +700,17 @@ class DepthToGridAndert(object):
             # vertical -- so the ground (x, y) is the takeoff (x, y) and no
             # takeoff detection is needed.
             cx, cy = float(cam_xyz[0]), float(cam_xyz[1])
-        n = self.grid.seed_free_disc(cx, cy, self.seed_radius)
+        n = grid.seed_free_disc(cx, cy, self.seed_radius)
         rospy.loginfo("asserted a %.2f m free disc at (%.2f, %.2f): %d cells "
                       "(%s)", self.seed_radius, cx, cy, n, self.seed_on
                       if self.seed_pose is None else "explicit ~seed_pose")
         if n == 0:
             rospy.logwarn("the free disc landed entirely outside the grid -- "
                           "the vehicle is not where the map thinks it is")
-        self.pub_seeded.publish(Bool(data=True))
 
     # --------------------------------------------------------------- publish
 
-    def publish(self, stamp):
+    def publish(self, stamp, valid_from):
         data = self.grid.to_int8()
         if self._wall is not None:
             # After to_int8, so precedence between "occupied" and "unknown" is
@@ -632,6 +720,7 @@ class DepthToGridAndert(object):
         g = OccupancyGrid()
         g.header.stamp = stamp
         g.header.frame_id = self.world_frame
+        g.info.map_load_time = rospy.Time.from_sec(valid_from)
         g.info.resolution = self.res
         g.info.width = self.grid.nx
         g.info.height = self.grid.ny

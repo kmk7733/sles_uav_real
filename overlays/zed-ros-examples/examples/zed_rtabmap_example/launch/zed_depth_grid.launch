@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <!--
-  2D horizontal occupancy grid directly from ZED depth + pose (no SLAM).
-  Runs only the grid node (+ optional rviz); the ZED wrapper itself is
+  2D horizontal occupancy grid from ZED depth and MAVROS EKF body pose.
+  Runs the fixed alignment owner, pose adapter, and optional grid/rviz. ZED is
   expected to be already running from ~/script_startup.sh, which launches it as
     ROS_NAMESPACE=rogx2 roslaunch zed_wrapper zed2i.launch
 
@@ -19,8 +19,8 @@
                 they can be compared on matched header stamps while the planner
                 keeps reading the one it has always read.
 
-  Default is `pointcloud`: the new node does not take /grid_map until the
-  offline and hand-carried comparisons are clean. See the port plan.
+  Default is `andert`, using the depth-image profile validated with MPPI.
+  Select `pointcloud` or `both` explicitly for comparisons.
 
   Run:
     roslaunch zed_rtabmap_example zed_depth_grid.launch camera_model:=zed2i
@@ -34,30 +34,42 @@
     <arg name="base_frame"     default="base_link" />
     <arg name="publish_urdf"   default="true" />
     <arg name="open_rviz"      default="true" />
+    <arg name="start_grid"     default="true" />
+    <arg name="start_alignment" default="true" />
+    <arg name="start_pose_adapter" default="true" />
+    <arg name="alignment_mode" default="novicon" />
+    <arg name="alignment_topic" default="/robot/frame_alignment" />
+    <arg name="alignment_max_age" default="0.5" />
+    <arg name="local_frame" default="fcu_local" />
+    <arg name="pose_in" default="/rogx2/mavros/local_position/pose" />
+    <arg name="pose_out" default="/robot/pose_world" />
+    <arg name="pose_epoch_out" default="/robot/pose_world_epoch" />
+    <arg name="fcu_state_topic" default="/rogx2/mavros/state" />
+    <arg name="vicon_topic" default="/vicon/ROGX2/ROGX2" />
+    <arg name="mount_calib" default="" />
+    <arg name="publish_wedge" default="true" />
+    <arg name="publish_footprint" default="true" />
 
     <!-- pointcloud | andert | both -->
-    <arg name="mapper"            default="pointcloud" />
+    <arg name="mapper"            default="andert" />
     <arg name="grid_topic"        default="/grid_map" />
     <arg name="grid_topic_andert" default="/grid_map_andert" />
 
-    <!-- world frame whose Z is gravity-up. 'map' = ZED tracking (IMU-aligned).
-         Point this at your VICON world frame for drift-free grids. -->
-    <arg name="world_frame"    default="map" />
+    <!-- Planning world uses EKF only after one initial alignment. -->
+    <arg name="world_frame"    default="plan_world" />
     <arg name="resolution"     default="0.05" />
     <!-- rectangular grid extents in the world (map) frame (m). Frame = robot's initial
-         heading: +x forward, +y left. Long arena side (10 m) is on x (forward), short
-         side (8 m) on y (lateral). Covers the arena with margin for a bottom-start ~[3-5,1]. -->
+         heading: +x forward, +y left. Both modes use a 7 x 5 m interior.
+         Here x[-1,6], y[-2.5,2.5] retains 1 m behind the initial EKF body; the
+         Vicon launch supplies its fixed-room origin. The 0.1 m wall ring below
+         makes either default grid 144 x 104 cells at 0.05 m. -->
     <arg name="grid_min_x"     default="-1.0" />   <!-- forward/heading -->
-    <arg name="grid_max_x"     default="10.0" />
-    <arg name="grid_min_y"     default="-5.0" />   <!-- lateral -->
-    <arg name="grid_max_y"     default="5.0" />
-    <!-- Fixed horizontal SLICE in the map frame. floor_alignment is OFF, so the map
-         origin = ZED-tracking START pose (0,0,0) and the ZED IMU keeps the map z-axis
-         vertical (grid plane parallel to the floor, verified ~0.3 deg off gravity).
-         Start the ZED node ON THE GROUND (before takeoff) => z=0 is the floor, pose z is
-         true altitude, and this [0.75,1.25] band is a fixed slice at 1.0 m above ground.
-         (If instead you start tracking while already hovering at 1 m, z=0 is the flight
-         height, so use a band centred on 0, e.g. -0.25..0.25.)
+    <arg name="grid_max_x"     default="6.0" />
+    <arg name="grid_min_y"     default="-2.5" />   <!-- lateral -->
+    <arg name="grid_max_y"     default="2.5" />
+    <!-- Fixed horizontal SLICE in the planning world. In novicon, z=0 is
+         the body height at initial EKF alignment, not a measured floor.
+         Initialize while on the ground; retain the existing [0.75,1.25] band.
          auto_floor OFF => band is absolute in world z, so the floor (constant negative z)
          is always excluded, even with the camera tilted down.
          THE ANDERT NODE READS THE SAME TWO NUMBERS, as centre +- half-thickness
@@ -94,8 +106,8 @@
          nothing until the band stops offering rays_per_col rows to choose
          from. The node warns when that happens. -->
     <arg name="decim"          default="2" />
-    <arg name="row_decim"      default="0" />
-    <arg name="rays_per_col"   default="8" />
+    <arg name="row_decim"      default="4" />
+    <arg name="rays_per_col"   default="2" />
     <arg name="map_hz"         default="10.0" />
     <arg name="z_min"          default="0.4" />
 
@@ -109,12 +121,43 @@
         </include>
     </group> -->
 
-    <!-- Point cloud -> 2D grid (the original) -->
-    <node if="$(eval arg('mapper') in ('pointcloud', 'both'))"
+    <node if="$(arg start_alignment)" name="ekf_world_align"
+          pkg="zed_rtabmap_example" type="ekf_world_align.py" output="screen">
+        <param name="mode" value="$(arg alignment_mode)" />
+        <param name="world_frame" value="$(arg world_frame)" />
+        <param name="local_frame" value="$(arg local_frame)" />
+        <param name="local_pose_topic" value="$(arg pose_in)" />
+        <param name="fcu_state_topic" value="$(arg fcu_state_topic)" />
+        <param name="vicon_topic" value="$(arg vicon_topic)" />
+        <param name="mount_calib" value="$(arg mount_calib)" />
+        <param name="alignment_topic" value="$(arg alignment_topic)" />
+    </node>
+
+    <node if="$(arg start_pose_adapter)" name="pose_to_world"
+          pkg="zed_rtabmap_example" type="pose_to_world.py" output="screen">
+        <remap from="~pose_in" to="$(arg pose_in)" />
+        <remap from="~pose_out" to="$(arg pose_out)" />
+        <param name="pose_epoch_out" value="$(arg pose_epoch_out)" />
+        <param name="world_frame" value="$(arg world_frame)" />
+        <param name="local_frame" value="$(arg local_frame)" />
+        <param name="alignment_topic" value="$(arg alignment_topic)" />
+        <param name="alignment_max_age" value="$(arg alignment_max_age)" />
+    </node>
+
+    <!-- Point cloud mapper keeps its inverse model, with the same EKF pose. -->
+    <node if="$(eval arg('start_grid') and arg('mapper') in ('pointcloud', 'both'))"
           name="depth_to_grid" pkg="zed_rtabmap_example" type="depth_to_grid.py" output="screen">
+        <env name="OMP_NUM_THREADS" value="1" />
+        <env name="OPENBLAS_NUM_THREADS" value="1" />
+        <env name="MKL_NUM_THREADS" value="1" />
         <remap from="~cloud_in" to="/$(arg camera_name)/$(arg zed_node_name)/point_cloud/cloud_registered" />
         <remap from="~grid_out" to="$(arg grid_topic)" />
         <param name="world_frame"         value="$(arg world_frame)" />
+        <param name="pose_topic" value="$(arg pose_epoch_out)" />
+        <param name="pose_frame" value="$(arg base_frame)" />
+        <param name="local_frame" value="$(arg local_frame)" />
+        <param name="alignment_topic" value="$(arg alignment_topic)" />
+        <param name="alignment_max_age" value="$(arg alignment_max_age)" />
         <param name="resolution"          value="$(arg resolution)" />
         <param name="grid_min_x"          value="$(arg grid_min_x)" />
         <param name="grid_max_x"          value="$(arg grid_max_x)" />
@@ -132,17 +175,28 @@
     </node>
 
     <!-- Depth image -> 2D grid, Andert IROS 2009 -->
-    <node if="$(eval arg('mapper') in ('andert', 'both'))"
+    <node if="$(eval arg('start_grid') and arg('mapper') in ('andert', 'both'))"
           name="depth_to_grid_andert" pkg="zed_rtabmap_example"
           type="depth_to_grid_andert.py" output="screen">
         <!-- The tail is memory-bound and threading it makes the p95 worse, not
              better: measured on this box, p95 173 -> 98 ms with one thread.
              A 10 Hz loop is decided by the tail. -->
         <env name="OMP_NUM_THREADS" value="1" />
+        <env name="OPENBLAS_NUM_THREADS" value="1" />
+        <env name="MKL_NUM_THREADS" value="1" />
         <remap from="~depth_in" to="/$(arg camera_name)/$(arg zed_node_name)/depth/depth_registered" />
         <remap from="~info_in"  to="/$(arg camera_name)/$(arg zed_node_name)/depth/camera_info" />
         <remap from="~grid_out" to="$(eval arg('grid_topic_andert') if arg('mapper') == 'both' else arg('grid_topic'))" />
         <param name="world_frame"         value="$(arg world_frame)" />
+        <param name="pose_source" value="topic" />
+        <param name="pose_topic" value="$(arg pose_epoch_out)" />
+        <param name="pose_frame" value="$(arg base_frame)" />
+        <param name="pose_max_dt" value="0.05" />
+        <param name="local_frame" value="$(arg local_frame)" />
+        <param name="alignment_topic" value="$(arg alignment_topic)" />
+        <param name="alignment_max_age" value="$(arg alignment_max_age)" />
+        <param name="publish_wedge" value="$(arg publish_wedge)" />
+        <param name="publish_footprint" value="$(arg publish_footprint)" />
         <param name="resolution"          value="$(arg resolution)" />
         <param name="grid_min_x"          value="$(arg grid_min_x)" />
         <param name="grid_max_x"          value="$(arg grid_max_x)" />

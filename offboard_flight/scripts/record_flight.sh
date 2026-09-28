@@ -5,6 +5,11 @@
 #   record_flight.sh depth           + compressed depth and camera_info:
 #                                      enough to RE-RUN the mapper offline
 #   record_flight.sh full            + raw depth, RGB and the point cloud
+#   record_flight.sh dataset         TRAINING COLLECTION -- everything above
+#                                    plus stereo RGB, raw depth and the label
+#                                    odometry, written in the ~/drone_data
+#                                    session layout extract_flight_dataset.py
+#                                    reads
 #   record_flight.sh --list          print the topic set and exit
 #
 # Start it BEFORE `fly.sh go` so the bag covers arming. Ctrl-C to stop.
@@ -57,10 +62,19 @@ PROFILE=${1:-light}
 # markers come through in millimetres, straight from the SDK.
 REGEX="/vicon/.*"
 
+# The three topics above /${NS}/mavros/setpoint_raw/local exist only when the
+# setpoints come from the GCS instead of the onboard planner (fly.sh
+# SOURCE=external) and the Vicon safety supervisor is in the chain. Listing
+# them unconditionally costs nothing -- rosbag simply records nothing for a
+# topic that never appears -- and without them an external-source bag cannot
+# say what the supervisor saw or whether it changed anything.
+
 TOPICS="
 /tf
 /tf_static
 /robot/pose_world
+/robot/pose_world_epoch
+/robot/frame_alignment
 
 /grid_map
 
@@ -73,6 +87,9 @@ TOPICS="
 /${NS}/mission_node/state
 
 /${NS}/commander/set_pose
+/${NS}/commander/set_pose_safe
+/${NS}/vicon_safety_supervisor/margin
+/${NS}/vicon_safety_supervisor/state
 /${NS}/mavros/setpoint_raw/local
 /${NS}/mavros/setpoint_raw/target_local
 /${NS}/mavros/state
@@ -107,7 +124,34 @@ full)
 /${NS}/zed2i/zed_node/point_cloud/cloud_registered
 "
     RATE="~700 MB/min -- do not leave running" ;;
-*)  echo "unknown profile '$PROFILE' (light | depth | full)" >&2; exit 1 ;;
+dataset)
+    # WHAT SEPARATES THIS FROM `full`. The three profiles above answer "what
+    # did the planner do"; this one has to answer "what can be learned from
+    # it", and that is a different topic set. A bag without
+    # left/image_rect_color is not a small dataset -- it is NOT A DATASET,
+    # because that topic is the extraction reference every sample is keyed on
+    # (config.yaml `reference_topic`), and local_position/odom is the label
+    # itself (`label_source: mavros_odom`). The 09-08 flight was recorded as
+    # `light` and yielded zero training samples for exactly this reason.
+    #
+    # It is the UNION, not a replacement: the supervisor, mission-state and
+    # set_pose topics above stay, so one bag answers both questions.
+    TOPICS="$TOPICS
+/${NS}/mavros/local_position/odom
+/${NS}/mavros/local_position/velocity_body
+/${NS}/mavros/altitude
+/${NS}/mavros/rc/in
+/${NS}/mavros/manual_control/control
+/${NS}/zed2i/zed_node/odom
+/${NS}/zed2i/zed_node/left/image_rect_color/compressed
+/${NS}/zed2i/zed_node/right/image_rect_color/compressed
+/${NS}/zed2i/zed_node/depth/depth_registered
+/${NS}/zed2i/zed_node/left/camera_info
+/${NS}/zed2i/zed_node/right/camera_info
+/${NS}/zed2i/zed_node/depth/camera_info
+"
+    RATE="~270 MB/min measured -- past sessions ran 0.7 to 1.8 GB" ;;
+*)  echo "unknown profile '$PROFILE' (light | depth | full | dataset)" >&2; exit 1 ;;
 esac
 
 if [ -n "$LIST" ]; then
@@ -116,16 +160,89 @@ if [ -n "$LIST" ]; then
     exit 0
 fi
 
-mkdir -p /home/rogx/bags
-OUT=/home/rogx/bags/flight_$(date +%Y%m%d_%H%M%S)_${PROFILE}
+STAMP=$(date +%Y%m%d_%H%M%S)
+
+if [ "$PROFILE" = dataset ]; then
+    # The session layout is not decoration. extract_flight_dataset.py is given
+    # a DIRECTORY and globs *.bag inside it, and --split is what lets a long
+    # flight exceed one file without anything downstream noticing. The naming
+    # and the rosbag options here are the ones every session in ~/drone_data
+    # was recorded with; matching them is what makes the old bags and the new
+    # ones one dataset instead of two.
+    SESSION=/home/rogx/drone_data/session_$STAMP
+    mkdir -p "$SESSION"
+    OUT=$SESSION/flight_$STAMP
+    BAG_OPTS="--lz4 --split --size=2048 -b 1024"
+    META=$SESSION/metadata.json
+else
+    mkdir -p /home/rogx/bags
+    OUT=/home/rogx/bags/flight_${STAMP}_${PROFILE}
+    BAG_OPTS="--lz4"
+fi
 
 echo "profile : $PROFILE  ($RATE)"
-echo "writing : ${OUT}.bag"
+echo "writing : ${OUT}_0.bag"
 echo "vicon   : $REGEX  (all subjects -- obstacles as well as the aircraft)"
 echo "free    : $(df -h /home/rogx | awk 'NR==2{print $4}')"
 echo "Ctrl-C to stop."
 echo
 
+CMD="rosbag record -O $OUT $BAG_OPTS -e $REGEX $(echo $TOPICS)"
+
+if [ -n "$META" ]; then
+    # Provenance only -- the extractor reads its own config.yaml, not this --
+    # but a session that cannot say what it recorded is a session nobody
+    # trusts a year later. Schema kept identical to record_flight.py's.
+    STAMP=$STAMP SESSION=$SESSION NS=$NS CMD=$CMD python3 - > "$META" <<'PYEOF'
+import json, os
+ns = '/' + os.environ['NS']
+state = [ns + t for t in ('/mavros/local_position/odom',
+                          '/mavros/local_position/pose',
+                          '/mavros/local_position/velocity_local',
+                          '/mavros/local_position/velocity_body',
+                          '/mavros/imu/data', '/mavros/altitude',
+                          '/mavros/state', '/zed2i/zed_node/odom',
+                          '/zed2i/zed_node/pose')] + ['/vicon/ROGX2/ROGX2']
+sensor = [ns + t for t in ('/zed2i/zed_node/left/image_rect_color/compressed',
+                           '/zed2i/zed_node/right/image_rect_color/compressed',
+                           '/zed2i/zed_node/depth/depth_registered',
+                           '/zed2i/zed_node/left/camera_info',
+                           '/zed2i/zed_node/right/camera_info',
+                           '/zed2i/zed_node/depth/camera_info')]
+print(json.dumps({
+    'session': os.path.basename(os.environ['SESSION']),
+    'created': os.environ['STAMP'],
+    'note': os.environ.get('NOTE', ''),
+    'drone_ns': ns,
+    'label_source': 'mavros_odom',
+    'label_topic': ns + '/mavros/local_position/odom',
+    'state_topics': state,
+    'rc_topics': [ns + '/mavros/rc/in', ns + '/mavros/manual_control/control'],
+    'sensor_topics': sensor,
+    # New next to record_flight.py's schema: what the flight itself did, which
+    # the training topics alone cannot reconstruct.
+    'analysis_topics': [ns + t for t in ('/commander/set_pose',
+                                         '/commander/set_pose_safe',
+                                         '/vicon_safety_supervisor/margin',
+                                         '/vicon_safety_supervisor/state',
+                                         '/mission_node/state',
+                                         '/mavros/setpoint_raw/local',
+                                         '/mavros/setpoint_raw/target_local',
+                                         '/mavros/extended_state')]
+                       + ['/grid_map', '/robot/pose_world', '/robot/pose_world_epoch', '/goal_arrive_tf'],
+    'tf_topics': ['/tf', '/tf_static'],
+    'rosbag_options': {'compression': 'lz4', 'split_size_mb': 2048,
+                       'buffer_size_mb': 1024},
+    'extraction_defaults': {
+        'reference_topic': ns + '/zed2i/zed_node/left/image_rect_color/compressed',
+        'sample_hz': 10.0, 'sync_slop_s': 0.05, 'save_depth_as': 'npy',
+        'horizon_len': 20, 'horizon_dt': 0.1},
+    'rosbag_command': os.environ['CMD'],
+}, indent=2))
+PYEOF
+    echo "metadata: $META"
+fi
+
 # A topic that does not exist yet is waited on rather than refused, so this is
 # safe to start before the planner and the mission node.
-exec rosbag record -O "$OUT" --lz4 -e "$REGEX" $TOPICS
+exec $CMD

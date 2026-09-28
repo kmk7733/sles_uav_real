@@ -324,6 +324,35 @@ def validate_profile_params(profile: ProfileParams, stereo: StereoParams,
 _COMPACT_AT = 0.5
 
 
+# Limit deferred profile work to this many intervals plus one traversal pass.
+# Four arrays retain 32 bytes per interval; a pass contains at most the original
+# number of selected rays. Concatenation/profile scratch is bounded likewise.
+_WALK_CHUNK_INTERVALS = 32768
+
+
+def _flush_walk_intervals(chunks, L, hit, ell_p, sigma_l, xz_norm, ell_near,
+                          p_min, eta, logit_p_min):
+    """Evaluate already traversed cell intervals without changing their order."""
+    if len(chunks) == 1:
+        cell_ids, ray_ids, t_cur, t_out = chunks[0]
+    else:
+        cell_ids, ray_ids, t_cur, t_out = (
+            np.concatenate([chunk[i] for chunk in chunks]) for i in range(4))
+    lp, norm = ell_p[ray_ids], xz_norm[ray_ids]
+    a = t_cur / norm
+    b = t_out / norm
+    ell_star = np.minimum(np.maximum(lp, a), b)
+    vals = np.full(ell_star.shape, logit_p_min, dtype=np.float64)
+    near = ell_star > ell_near[ray_ids]
+    if near.any():
+        vals[near] = inverse_measurement_logodds(
+            ell_star[near], lp[near], sigma_l[ray_ids[near]], p_min, eta)
+    # Concatenation retains the original step-major, then ray-major order,
+    # including duplicate indices and the order of any signed-zero maxima.
+    np.maximum.at(L.ravel(), cell_ids, vals)
+    hit.ravel()[cell_ids] = True
+
+
 def _walk_lines(x0, z0, dx, dz, ell_p, sigma_l, ell_end, xz_norm,
                 cell, grid_w, grid_h, p_min, eta, max_steps=None):
     """Amanatides-Woo grid traversal, vectorised over rays. Returns (L, hit).
@@ -334,9 +363,10 @@ def _walk_lines(x0, z0, dx, dz, ell_p, sigma_l, ell_end, xz_norm,
     interval, because the profile is unimodal.
 
     Every ray advances by ONE CELL per iteration, so the loop runs for as many
-    iterations as the longest ray has cells and each iteration is one vectorised
-    pass over all rays. Nothing is sampled twice and nothing is missed, which a
-    fixed-step sampler cannot promise in either direction.
+    iterations as the longest ray has cells. Profile evaluation and the cell
+    maximum are deferred in bounded batches; they do not feed the recurrence.
+    Nothing is sampled twice and nothing is missed, which a fixed-step sampler
+    cannot promise in either direction.
 
     `ell` is 3-D Euclidean distance along the measurement line; the walk itself
     is in the grid plane, where distance is `ell * xz_norm`. Dividing back is
@@ -441,7 +471,13 @@ def _walk_lines(x0, z0, dx, dz, ell_p, sigma_l, ell_end, xz_norm,
     ell_p = np.broadcast_to(np.asarray(ell_p, dtype=np.float64), (n,))
     sigma_l = np.broadcast_to(np.asarray(sigma_l, dtype=np.float64), (n,))
     xz_norm = np.broadcast_to(np.asarray(xz_norm, dtype=np.float64), (n,))
+    # This boundary belongs to the ray, not the cell. Preserve the original
+    # multiply/subtract order, but do it once rather than on every walk pass.
+    ell_near = ell_p - _NEAR_SIGMAS * sigma_l
 
+    ray_id = np.arange(n)
+    chunks = []
+    n_intervals = 0
     for _ in range(int(max_steps)):
         n_alive = int(alive.sum())
         if n_alive == 0:
@@ -449,45 +485,32 @@ def _walk_lines(x0, z0, dx, dz, ell_p, sigma_l, ell_end, xz_norm,
         if n_alive < _COMPACT_AT * alive.shape[0]:
             k = np.flatnonzero(alive)
             (ix, iz, step_x, step_z, t_delta_x, t_delta_z, t_max_x, t_max_z,
-             t_cur, t_end, ell_p, sigma_l, xz_norm) = (
+             t_cur, t_end, ray_id) = (
                 ix[k], iz[k], step_x[k], step_z[k], t_delta_x[k],
                 t_delta_z[k], t_max_x[k], t_max_z[k], t_cur[k], t_end[k],
-                ell_p[k], sigma_l[k], xz_norm[k])
+                ray_id[k])
             alive = np.ones(k.shape[0], dtype=bool)
 
         t_out = np.minimum(np.minimum(t_max_x, t_max_z), t_end)
-        # The cell's interval in 3-D line distance.
-        a = t_cur / xz_norm
-        b = t_out / xz_norm
-        # See the note in inverse_measurement_logodds: np.clip's wrapper is
-        # too expensive to call once per cell. a <= b by construction here
-        # (b is t_out/xz_norm and t_out >= t_cur), so the nesting order is the
-        # same clamp.
-        ell_star = np.minimum(np.maximum(ell_p, a), b)
-
-        # THE FULL PROFILE IS EVALUATED ONLY NEAR THE PEAK. Everywhere else in
-        # front of the surface it is the constant logit(p_min) -- see
-        # _NEAR_SIGMAS. The subset is small (a ~6-cell window on a ~50-cell
-        # walk), so this replaces eight full-width array ops with one compare,
-        # one fill, and eight ops on a tenth of the rays.
-        vals = np.full(ell_star.shape, logit_p_min, dtype=np.float64)
-        near = ell_star > ell_p - _NEAR_SIGMAS * sigma_l
-        if near.any():
-            vals[near] = inverse_measurement_logodds(
-                ell_star[near], ell_p[near], sigma_l[near], p_min, eta)
-
         ok = (alive & (ix >= 0) & (ix < grid_w) & (iz >= 0) & (iz < grid_h)
               & (t_out > t_cur))
         if ok.any():
-            np.maximum.at(L, (iz[ok], ix[ok]), vals[ok])
-            hit[iz[ok], ix[ok]] = True
+            # These gathers copy the intervals before the traversal advances.
+            # Ray ids retain the original profile parameters across compaction;
+            # cell/profile evaluation never changes a later traversal step.
+            ids = ray_id[ok]
+            chunks.append((iz[ok] * grid_w + ix[ok], ids,
+                           t_cur[ok], t_out[ok]))
+            n_intervals += ids.size
+            if n_intervals >= _WALK_CHUNK_INTERVALS:
+                _flush_walk_intervals(chunks, L, hit, ell_p, sigma_l, xz_norm,
+                                      ell_near, p_min, eta, logit_p_min)
+                chunks.clear()
+                n_intervals = 0
 
         # Advance one cell along whichever axis boundary comes first.
-        # The two masks are each used twice and the in-place forms write
-        # through their own buffers, which is four array ops and four
-        # temporaries per pass that used to be paid for nothing. At ~43 numpy
-        # calls per pass and ~175 passes a frame, the dispatch overhead on
-        # these small arrays IS the cost -- not the arithmetic.
+        # Keep the original masks, tie direction and repeated additions:
+        # changing a boundary recurrence can change which cells are visited.
         take_x = t_max_x <= t_max_z
         m_x = alive & take_x
         m_z = alive & ~take_x
@@ -498,11 +521,38 @@ def _walk_lines(x0, z0, dx, dz, ell_p, sigma_l, ell_end, xz_norm,
         np.add(t_max_z, t_delta_z, out=t_max_z, where=m_z)
         alive &= t_cur < t_end
 
+    if chunks:
+        _flush_walk_intervals(chunks, L, hit, ell_p, sigma_l, xz_norm,
+                              ell_near, p_min, eta, logit_p_min)
     L[~hit] = 0.0
     return L, hit
 
 
 # ------------------------------------------------------------ frame builder
+
+# One immutable entry bounds retained memory when cameras/calibrations change.
+# Store the key and arrays together: another callback may replace the cache,
+# but a caller keeps its own complete entry. No camera pose or depth is cached.
+_CAMERA_GEOMETRY_CACHE = None
+
+
+def _camera_geometry(h, w, fx, fy, cx, cy):
+    global _CAMERA_GEOMETRY_CACHE
+    key = (h, w, fx, fy, cx, cy)
+    entry = _CAMERA_GEOMETRY_CACHE
+    if entry is not None and entry[0] == key:
+        return entry[1]
+    v_idx, u_idx = np.indices((h, w))
+    x_n = (u_idx - cx) / fx
+    y_n = (v_idx - cy) / fy
+    obliquity = np.sqrt(1.0 + x_n * x_n + y_n * y_n)
+    geometry = (obliquity, x_n / obliquity, y_n / obliquity,
+                1.0 / obliquity)
+    for array in geometry:
+        array.flags.writeable = False
+    _CAMERA_GEOMETRY_CACHE = (key, geometry)
+    return geometry
+
 
 def build_frame_grid(depth, pose, stereo: StereoParams, cell, grid_w, grid_h,
                      plane_y, plane_tol, profile: Optional[ProfileParams] = None,
@@ -540,13 +590,10 @@ def build_frame_grid(depth, pose, stereo: StereoParams, cell, grid_w, grid_h,
         return (np.zeros((grid_h, grid_w), dtype=np.float64),
                 np.zeros((grid_h, grid_w), dtype=bool))
 
-    v_idx, u_idx = np.indices((h, w))
-    x_n = (u_idx - stereo.cx) / stereo.fx
-    y_n = (v_idx - stereo.cy) / stereo.fy
-    obliquity = np.sqrt(1.0 + x_n * x_n + y_n * y_n)      # l_p / Z
-
-    # p^C = Z K^-1 [u v 1]^T ; direction is that, normalised.
-    rx_c, ry_c, rz_c = x_n / obliquity, y_n / obliquity, 1.0 / obliquity
+    # Calibration and image shape determine these arrays, independently of
+    # depth and pose. The cached arithmetic is identical to the uncached form.
+    obliquity, rx_c, ry_c, rz_c = _camera_geometry(
+        h, w, stereo.fx, stereo.fy, stereo.cx, stereo.cy)
     rx_w = T[0, 0] * rx_c + T[0, 1] * ry_c + T[0, 2] * rz_c
     ry_w = T[1, 0] * rx_c + T[1, 1] * ry_c + T[1, 2] * rz_c
     rz_w = T[2, 0] * rx_c + T[2, 1] * ry_c + T[2, 2] * rz_c
@@ -596,18 +643,24 @@ def build_frame_grid(depth, pose, stereo: StereoParams, cell, grid_w, grid_h,
         return (np.zeros((grid_h, grid_w), dtype=np.float64),
                 np.zeros((grid_h, grid_w), dtype=bool))
 
-    sigma_z = disparity_to_depth_sigma(z_safe, stereo.fx, stereo.baseline_m,
+    # The band/ray selection has already decided which measurements contribute.
+    # Evaluate their uncertainty with the same arithmetic, in the same order,
+    # without calculating uncertainty for discarded pixels.
+    sel = valid
+    z_sel = z_safe[sel]
+    ell_p_sel = ell_p[sel]
+    xz_sel = xz_norm[sel]
+    sigma_z = disparity_to_depth_sigma(z_sel, stereo.fx, stereo.baseline_m,
                                        stereo.sigma_disp_px)
-    sigma_l = depth_sigma_to_line_sigma(sigma_z, ell_p, z_safe)
+    sigma_l = depth_sigma_to_line_sigma(sigma_z, ell_p_sel, z_sel)
     sigma_l = np.maximum(sigma_l, _SIGMA_L_FLOOR_CELLS * cell)
 
     # Draw only as far as the profile carries information.
-    ell_end = np.minimum(ell_p + _TAIL_SIGMAS * sigma_l,
-                         stereo.z_max_m * obliquity)
+    ell_end = np.minimum(ell_p_sel + _TAIL_SIGMAS * sigma_l,
+                         stereo.z_max_m * obliquity[sel])
 
-    sel = valid
     return _walk_lines(
-        np.full(int(sel.sum()), px), np.full(int(sel.sum()), pz),
-        (rx_w / xz_norm)[sel], (rz_w / xz_norm)[sel],
-        ell_p[sel], sigma_l[sel], ell_end[sel], xz_norm[sel],
+        np.full(z_sel.size, px), np.full(z_sel.size, pz),
+        rx_w[sel] / xz_sel, rz_w[sel] / xz_sel,
+        ell_p_sel, sigma_l, ell_end, xz_sel,
         float(cell), int(grid_w), int(grid_h), profile.p_min, profile.eta)

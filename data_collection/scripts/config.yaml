@@ -82,6 +82,9 @@ sensor_topics:
 tf_topics:
   - "/tf"
   - "/tf_static"
+  # Authoritative local->world transform, readiness, and episode epoch.
+  - "/robot/frame_alignment"
+  - "/robot/pose_world_epoch"
 
 # -----------------------------------------------------------------------------
 # rosbag record options (used by record_flight.py)

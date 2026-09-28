@@ -1,0 +1,81 @@
+{
+  "label": "Inactive explicit example: existing ROGX fly.sh HAA defaults; full HPA and true HAA envelopes from current local config.yaml, not independently verified physical aircraft limits. Existing flight scripts do not load this; shadow may use it for diagnostic reconstruction only. Map unknown_unsafe=true/unknown_inflate=0 and footprint clearing remain the caller's separate contract.",
+  "dt": 0.1,
+  "haa": {
+    "limits": {
+      "v_max": 0.31,
+      "a_max": 3.5,
+      "omega_max": 0.4887,
+      "alpha_max": 3.85,
+      "tilt_max": 0.610865,
+      "j_max": 5.5
+    },
+    "horizon": 60,
+    "num_samples": 192,
+    "sigma": [
+      0.2161124707183739,
+      0.2161124707183739,
+      0.34069085303248164
+    ],
+    "temperature": 1.0,
+    "seed": 0,
+    "goal_tol": 0.25,
+    "cap_velocity": true,
+    "use_geodesic": true,
+    "w_frontier": 5.0,
+    "c_occupied": 2.0,
+    "c_unknown": -4.0,
+    "weights": {
+      "w_goal": 1.0,
+      "w_term_pos": 10.0,
+      "w_term_vel": 2.0,
+      "w_obs": 20.0,
+      "d_influence": 0.6,
+      "R_dnu": [
+        1.0,
+        1.0,
+        0.2
+      ],
+      "w_yaw": 0.0,
+      "yaw_mode": "velocity"
+    },
+    "cost_normalise": true,
+    "beta_min": 0.015625,
+    "max_sample_sweeps": 24
+  },
+  "safety": {
+    "r_safe": 0.51,
+    "sweep_step": 0.025
+  },
+  "haa_true_limits": {
+    "v_max": 0.35,
+    "a_max": 3.5,
+    "omega_max": 0.5236,
+    "alpha_max": 3.85,
+    "tilt_max": 0.6108652381980153,
+    "j_max": 5.5
+  },
+  "hpa": {
+    "limits": {
+      "v_max": 0.5,
+      "a_max": 5.0,
+      "omega_max": 0.5236,
+      "alpha_max": 4.0,
+      "tilt_max": 0.7853981633974483,
+      "j_max": 8.0
+    },
+    "goal_tol": 0.25,
+    "commit": 1
+  },
+  "desimplex": {
+    "n_r": 2,
+    "n_m": 3,
+    "probe_seed": 0,
+    "transition_steps": 6,
+    "recovery_margin": 0.0,
+    "warm_haa": false,
+    "n_look": 1,
+    "handover_decel": false,
+    "seed_nominal": false
+  }
+}

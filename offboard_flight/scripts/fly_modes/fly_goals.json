@@ -1,0 +1,127 @@
+{
+ "schema": 1,
+ "frame": "vicon/world",
+ "seed": 20260927,
+ "count": 20,
+ "primary": 15,
+ "spare_rule": "a primary goal that fails goals-check on the day's map is flown by NO method; the next unused spare (16, 17, ...) replaces it for ALL three",
+ "region": {
+  "x": [
+   2.1,
+   2.4
+  ],
+  "y": [
+   -2.0,
+   0.5
+  ]
+ },
+ "clearance_required_m": 0.56,
+ "border_wall_faces": {
+  "y_min": -2.45,
+  "x_max": 3.0
+ },
+ "rejected_near_border_wall": 3,
+ "generator": "fly_helper.py make-goals (random.Random(seed).uniform x then y; reject near border wall)",
+ "goals": [
+  {
+   "index": 1,
+   "x": 2.372,
+   "y": -0.784
+  },
+  {
+   "index": 2,
+   "x": 2.398,
+   "y": -1.822
+  },
+  {
+   "index": 3,
+   "x": 2.249,
+   "y": 0.412
+  },
+  {
+   "index": 4,
+   "x": 2.304,
+   "y": -1.223
+  },
+  {
+   "index": 5,
+   "x": 2.156,
+   "y": -0.339
+  },
+  {
+   "index": 6,
+   "x": 2.205,
+   "y": -0.654
+  },
+  {
+   "index": 7,
+   "x": 2.367,
+   "y": -0.432
+  },
+  {
+   "index": 8,
+   "x": 2.251,
+   "y": -0.698
+  },
+  {
+   "index": 9,
+   "x": 2.379,
+   "y": -1.294
+  },
+  {
+   "index": 10,
+   "x": 2.286,
+   "y": -0.931
+  },
+  {
+   "index": 11,
+   "x": 2.227,
+   "y": -1.863
+  },
+  {
+   "index": 12,
+   "x": 2.284,
+   "y": -0.26
+  },
+  {
+   "index": 13,
+   "x": 2.221,
+   "y": -1.681
+  },
+  {
+   "index": 14,
+   "x": 2.398,
+   "y": -0.486
+  },
+  {
+   "index": 15,
+   "x": 2.109,
+   "y": 0.474
+  },
+  {
+   "index": 16,
+   "x": 2.141,
+   "y": -1.671
+  },
+  {
+   "index": 17,
+   "x": 2.148,
+   "y": -0.682
+  },
+  {
+   "index": 18,
+   "x": 2.114,
+   "y": 0.201
+  },
+  {
+   "index": 19,
+   "x": 2.126,
+   "y": -0.419
+  },
+  {
+   "index": 20,
+   "x": 2.11,
+   "y": -1.231
+  }
+ ]
+}

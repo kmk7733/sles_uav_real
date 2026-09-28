@@ -1,0 +1,26 @@
+# REVIEW TEMPLATE ONLY. Null values deliberately prevent node startup.
+# These are operational limits, not training sensor-gap thresholds.
+# Load into /<robot namespace>/guarded_mission_node only after review.
+# This node replaces the mission executable in a NEW exclusive launch;
+# never run it alongside original mission_node.py, setpoint_buffer.py or fly.sh.
+auto_start: false
+require_frame_alignment: true
+sp_topic: commander/set_pose_safe
+safe_topic: commander/set_pose_safe
+nominal_topic: commander/set_pose
+guard_topic: commander/collision_stop_status
+execution_topic: commander/collision_stop_execution
+alignment_topic: /robot/frame_alignment
+session_id: null  # fresh unique id, identical to the guard's profile
+stop_policy: settled_velocity
+stop_speed_threshold: null  # norm(v_ENU_xyz), m/s, must be positive
+stop_settle_seconds: null  # dwell covered by distinct post-hold PX4 samples
+stop_velocity_timeout: null  # max age AND max interval between samples, s
+guard_timeout: null  # status header and receipt age, s
+future_tolerance: null  # guard status clock tolerance, s
+mav_timeout: null  # MAVROS state receipt age, s
+pose_timeout: null  # PX4 local pose header and receipt age, s
+alignment_timeout: null  # shared frame heartbeat age, s
+sp_timeout: null  # safe nominal input age, s
+land_retry_interval: null  # seconds between AUTO.LAND attempts
+land_max_attempts: null  # positive integer; exhaustion retains hold

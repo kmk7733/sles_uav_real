@@ -2,26 +2,30 @@
 """
 depth_to_grid.py  -- 2D horizontal occupancy grid directly from a ZED point cloud + pose.
 
-No SLAM. Each incoming cloud is transformed camera->world by the pose TF (full
-orientation), so the grid is projected onto a true gravity-aligned horizontal plane.
+No SLAM. Each cloud uses the nearest EKF world body pose and static camera
+extrinsics (full orientation), with the same alignment epoch as the planner.
 Points in a height band [floor+z_min, floor+z_max] become obstacles; the space along
 each beam is cleared to free. Log-odds accumulation, published at cloud rate.
 
 Grid is a fixed rectangular window in the world frame, given by [min_x,max_x] x
-[min_y,max_y] (defaults sized to cover an 8x10 m arena with margin, robot starting
-near the bottom). For exact arena alignment, use a VICON world frame with the arena
-corner as origin and set the extents to the arena (e.g. 0..8 x 0..10).
+[min_y,max_y]. Defaults match zed_depth_grid.launch: a 7x5 m interior,
+x[-1,6], y[-2.5,2.5], relative to the initial EKF body. The Vicon launch passes
+its fixed-room origin while retaining the same 7x5 m dimensions.
 
 Subscribes:  ~cloud_in  (sensor_msgs/PointCloud2, registered, in a camera frame)
 Publishes:   ~grid_out  (nav_msgs/OccupancyGrid, in <world_frame>)
 """
 import time
+import threading
 import numpy as np
 import rospy
-import tf2_ros
+from geometry_msgs.msg import TransformStamped
+from std_msgs.msg import String
+from tf2_msgs.msg import TFMessage
 from sensor_msgs.msg import PointCloud2
 from nav_msgs.msg import OccupancyGrid
 from tf.transformations import quaternion_matrix
+from ekf_alignment import SharedFrameAlignment
 
 _PF = {1: 'i1', 2: 'u1', 3: 'i2', 4: 'u2', 5: 'i4', 6: 'u4', 7: 'f4', 8: 'f8'}
 
@@ -44,15 +48,15 @@ def cloud_to_xyz(msg):
 
 class DepthToGrid(object):
     def __init__(self):
-        self.world_frame = rospy.get_param('~world_frame', 'map')
+        self.world_frame = rospy.get_param('~world_frame', 'plan_world')
         # tf2 rejects leading '/' in lookups; messages keep the name verbatim
         self.world_frame_tf = self.world_frame.lstrip('/')
         self.res   = float(rospy.get_param('~resolution', 0.05))
         # rectangular world-frame extents (m)
-        self.min_x = float(rospy.get_param('~grid_min_x', -5.0))
-        self.max_x = float(rospy.get_param('~grid_max_x',  5.0))
-        self.min_y = float(rospy.get_param('~grid_min_y', -2.0))
-        self.max_y = float(rospy.get_param('~grid_max_y', 10.0))
+        self.min_x = float(rospy.get_param('~grid_min_x', -1.0))
+        self.max_x = float(rospy.get_param('~grid_max_x',  6.0))
+        self.min_y = float(rospy.get_param('~grid_min_y', -2.5))
+        self.max_y = float(rospy.get_param('~grid_max_y', 2.5))
         self.z_min = float(rospy.get_param('~obstacle_min_height', 0.15))
         self.z_max = float(rospy.get_param('~obstacle_max_height', 2.0))
         self.auto_floor = bool(rospy.get_param('~auto_floor', True))
@@ -105,31 +109,123 @@ class DepthToGrid(object):
         self._floor = None
         self._warned = 0
 
-        self.tf_buf = tf2_ros.Buffer(cache_time=rospy.Duration(5.0))
-        self.tf_lis = tf2_ros.TransformListener(self.tf_buf)
+        self._lock = threading.RLock()
+        self.alignment = SharedFrameAlignment(
+            self.world_frame_tf, rospy.get_param('~local_frame', 'fcu_local'))
+        self.alignment_max_age = float(rospy.get_param('~alignment_max_age', 0.5))
+        self.pose_max_dt = float(rospy.get_param('~pose_max_dt', 0.05))
+        self.frame_max_age = float(rospy.get_param('~frame_max_age', 0.25))
+        self.pose_frame = rospy.get_param('~pose_frame', 'base_link').lstrip('/')
+        self._ready = False
+        self._generation = 0
+        self._poses = []
+        self._static = {}
+        self._extrinsics = {}
         self.pub = rospy.Publisher('~grid_out', OccupancyGrid, queue_size=1)
+        self.sub_alignment = rospy.Subscriber(
+            rospy.get_param('~alignment_topic', '/robot/frame_alignment'),
+            String, self.cb_alignment, queue_size=10)
+        self.sub_pose = rospy.Subscriber(
+            rospy.get_param('~pose_topic', '/robot/pose_world_epoch'),
+            TransformStamped, self.cb_pose, queue_size=50)
+        self.sub_static = rospy.Subscriber('/tf_static', TFMessage,
+                                            self.cb_static, queue_size=50)
+        self._alignment_timer = rospy.Timer(rospy.Duration(0.1), self.check_alignment)
         self.sub = rospy.Subscriber('~cloud_in', PointCloud2, self.cb,
                                     queue_size=1, buff_size=2 ** 24)
         rospy.loginfo("depth_to_grid: %dx%d cells @ %.3fm, x[%.1f,%.1f] y[%.1f,%.1f], world=%s",
                       self.nx, self.ny, self.res, self.min_x, self.max_x,
                       self.min_y, self.max_y, self.world_frame)
 
-    def lookup(self, frame):
-        # latest transform, tiny timeout -> bounded callback latency
-        try:
-            t = self.tf_buf.lookup_transform(self.world_frame_tf, frame, rospy.Time(0),
-                                             rospy.Duration(0.01))
-        except (tf2_ros.LookupException, tf2_ros.ExtrapolationException,
-                tf2_ros.ConnectivityException):
-            return None
-        q = t.transform.rotation
-        tr = t.transform.translation
+    def _clear_epoch(self):
+        self._generation += 1
+        self.L = np.zeros((self.ny, self.nx), dtype=np.float32)
+        if self._wall is not None:
+            self.L[self._wall] = self.l_max
+        self._floor = None
+        self._poses.clear()
+
+    def _ready_locked(self):
+        ready = self.alignment.is_ready(rospy.Time.now().to_sec(), self.alignment_max_age)
+        if self._ready and not ready:
+            self._clear_epoch()
+        self._ready = ready
+        return ready
+
+    def cb_alignment(self, msg):
+        with self._lock:
+            if self.alignment.update_status(msg.data, rospy.Time.now().to_sec()):
+                self._clear_epoch()
+                self._ready = False
+            self._ready_locked()
+
+    def check_alignment(self, _event):
+        with self._lock:
+            self._ready_locked()
+
+    def cb_pose(self, msg):
+        if msg.header.frame_id.lstrip('/') != self.world_frame_tf:
+            return
+        p, q = msg.transform.translation, msg.transform.rotation
         M = quaternion_matrix([q.x, q.y, q.z, q.w])
-        M[:3, 3] = [tr.x, tr.y, tr.z]
-        return M.astype(np.float32)
+        M[:3, 3] = [p.x, p.y, p.z]
+        if not np.isfinite(M).all():
+            return
+        with self._lock:
+            stamp = msg.header.stamp.to_sec()
+            if (not self._ready_locked() or stamp < self.alignment.valid_from or
+                    msg.child_frame_id != 'ekf_body/epoch/' + self.alignment.epoch):
+                return
+            self._poses.append((stamp, M))
+            if len(self._poses) > 128:
+                del self._poses[:64]
+
+    def cb_static(self, msg):
+        with self._lock:
+            for tr in msg.transforms:
+                t, q = tr.transform.translation, tr.transform.rotation
+                M = quaternion_matrix([q.x, q.y, q.z, q.w])
+                M[:3, 3] = [t.x, t.y, t.z]
+                self._static[(tr.header.frame_id.lstrip('/'), tr.child_frame_id.lstrip('/'))] = M
+            self._extrinsics.clear()
+
+    def lookup(self, frame, stamp):
+        """Use the measured EKF pose nearest cloud time and static body extrinsics."""
+        frame = frame.lstrip('/')
+        T = self._extrinsics.get(frame)
+        if T is None:
+            stack, seen = [(self.pose_frame, np.eye(4))], {self.pose_frame}
+            while stack:
+                node, M = stack.pop()
+                if node == frame:
+                    T = self._extrinsics[frame] = M
+                    break
+                for (parent, child), edge in self._static.items():
+                    if parent == node and child not in seen:
+                        seen.add(child)
+                        stack.append((child, M.dot(edge)))
+        if T is None or not self._poses:
+            return None
+        t, pose = min(self._poses, key=lambda pair: abs(pair[0] - stamp))
+        if abs(t-stamp) > self.pose_max_dt:
+            return None
+        return pose.dot(T).astype(np.float32)
 
     def cb(self, msg):
         t0 = time.time()
+        stamp = msg.header.stamp.to_sec()
+        with self._lock:
+            now = rospy.Time.now().to_sec()
+            if (not self._ready_locked() or stamp < self.alignment.valid_from or
+                    stamp > now + 0.05 or now - stamp > self.frame_max_age):
+                return
+            generation, epoch = self._generation, self.alignment.epoch
+            valid_from = self.alignment.valid_from
+            L, floor_previous = self.L, self._floor
+            M = self.lookup(msg.header.frame_id, stamp)
+        if M is None:
+            rospy.logwarn_throttle(5.0, 'depth_to_grid: no matching EKF pose/static camera transform')
+            return
         xyz = cloud_to_xyz(msg)
         if self.stride > 1:
             xyz = xyz[::self.stride]
@@ -138,22 +234,13 @@ class DepthToGrid(object):
         xyz = xyz[keep]
         if xyz.shape[0] == 0:
             return
-        M = self.lookup(msg.header.frame_id)
-        if M is None:
-            self._warned += 1
-            if self._warned % 30 == 1:
-                rospy.logwarn("depth_to_grid: no TF %s <- %s yet",
-                              self.world_frame, msg.header.frame_id)
-            return
-
         sensor = M[:3, 3]
         pw = xyz.dot(M[:3, :3].T) + sensor
         zc = pw[:, 2]
         if self.auto_floor:
             f_now = float(np.percentile(zc[::8], 5.0))
-            self._floor = f_now if self._floor is None else \
-                (1.0 - self.floor_ema) * self._floor + self.floor_ema * f_now
-            floor = self._floor
+            floor = f_now if floor_previous is None else \
+                (1.0 - self.floor_ema) * floor_previous + self.floor_ema * f_now
         else:
             floor = self.floor_z
 
@@ -186,19 +273,25 @@ class DepthToGrid(object):
         oin = (cx >= 0) & (cx < nx) & (cy >= 0) & (cy < ny)
         occ_cnt = np.bincount((cy[oin] * nx + cx[oin]), minlength=m)
 
-        self.L -= (self.l_free * np.minimum(free_cnt, 1.0)).reshape(ny, nx)
-        self.L += (self.l_occ * (occ_cnt >= self.min_hits)).astype(np.float32).reshape(ny, nx)
-        np.clip(self.L, self.l_min, self.l_max, out=self.L)
+        L -= (self.l_free * np.minimum(free_cnt, 1.0)).reshape(ny, nx)
+        L += (self.l_occ * (occ_cnt >= self.min_hits)).astype(np.float32).reshape(ny, nx)
+        np.clip(L, self.l_min, self.l_max, out=L)
 
         if self._wall is not None:
             # border wall prior: always occupied, immune to ray clearing
-            self.L[self._wall] = self.l_max
+            L[self._wall] = self.l_max
 
         if self.near_free_enable:
             occ_hit = (occ_cnt >= self.min_hits).reshape(ny, nx)
-            self._seed_near_free(sensor[0], sensor[1], occ_hit)
+            self._seed_near_free(sensor[0], sensor[1], occ_hit, L)
 
-        self.publish(msg.header.stamp)
+        with self._lock:
+            if (not self._ready_locked() or generation != self._generation or
+                    epoch != self.alignment.epoch):
+                return
+            if self.auto_floor:
+                self._floor = floor
+            self.publish(msg.header.stamp, valid_from)
         if self.timing:
             t3 = time.time()
             rospy.loginfo_throttle(
@@ -206,7 +299,7 @@ class DepthToGrid(object):
                 % (xyz.shape[0], (t1 - t0) * 1e3, (t2 - t1) * 1e3,
                    (t3 - t2) * 1e3, (t3 - t0) * 1e3, 1.0 / max(t3 - t0, 1e-3)))
 
-    def _seed_near_free(self, sx, sy, occ_hit):
+    def _seed_near_free(self, sx, sy, occ_hit, L):
         """Force cells within near_free_radius of (sx, sy) to strong free,
         except confident obstacles (L >= occ_thr) and cells hit this frame."""
         r = self.near_free_radius
@@ -219,17 +312,18 @@ class DepthToGrid(object):
         xs = self.min_x + (np.arange(x0, x1) + 0.5) * self.res
         ys = self.min_y + (np.arange(y0, y1) + 0.5) * self.res
         mask = ((xs[None, :] - sx) ** 2 + (ys[:, None] - sy) ** 2) <= r * r
-        patch = self.L[y0:y1, x0:x1]
+        patch = L[y0:y1, x0:x1]
         protect = (patch >= self.occ_thr) | occ_hit[y0:y1, x0:x1]
         patch[mask & ~protect] = self.l_min
 
-    def publish(self, stamp):
+    def publish(self, stamp, valid_from):
         data = np.full(self.L.shape, -1, dtype=np.int8)
         data[self.L >= self.occ_thr] = 100
         data[self.L <= self.free_thr] = 0
         g = OccupancyGrid()
         g.header.stamp = stamp
         g.header.frame_id = self.world_frame
+        g.info.map_load_time = rospy.Time.from_sec(valid_from)
         g.info.resolution = self.res
         g.info.width = self.nx
         g.info.height = self.ny

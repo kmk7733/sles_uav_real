@@ -288,14 +288,22 @@ class PlanarMPPI(object):
         # never worse than last cycle's answer, which matters for the step-3
         # fallback: there is always at least one candidate that was valid once.
         U[0] = U_nom
-        U = self.dyn.clip_inputs(U, a_prev=a_prev)
+        # An optional batch backend (planner/haa/cuda_batch.py) evaluates the
+        # same clip -> rollout -> reject for all K samples elsewhere and hands
+        # back per-node cost parts; None keeps this NumPy path unchanged.
+        backend = getattr(self, "batch_backend", None)
+        cost_parts = None
+        if backend is not None:
+            U, X, valid, cost_parts = backend.evaluate(self, xi0, U, goal, a_prev)
+        else:
+            U = self.dyn.clip_inputs(U, a_prev=a_prev)
 
-        X = self.dyn.rollout(xi0, U)
+            X = self.dyn.rollout(xi0, U)
 
-        # --- reject ------------------------------------------------------
-        valid = self.dyn.states_ok(X)
-        valid &= self.dyn.inputs_ok(U, a_prev=a_prev)
-        valid &= self.validator.nodes_safe(X[..., S_POS])
+            # --- reject --------------------------------------------------
+            valid = self.dyn.states_ok(X)
+            valid &= self.dyn.inputs_ok(U, a_prev=a_prev)
+            valid &= self.validator.nodes_safe(X[..., S_POS])
         n_valid = int(valid.sum())
 
         X_viz = None
@@ -317,7 +325,8 @@ class PlanarMPPI(object):
                               reason + "; braking also unsafe", X_viz)
 
         # --- weight ------------------------------------------------------
-        S = self._cost(X, U, goal, a_prev)
+        S = (self._cost(X, U, goal, a_prev) if cost_parts is None
+             else self._cost_from_parts(X, U, goal, a_prev, cost_parts))
         S = np.where(valid, S, np.inf)
         Sv = S[valid]
         Smin = float(Sv.min())

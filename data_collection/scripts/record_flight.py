@@ -185,6 +185,8 @@ def main():
         "drone_ns": cfg.ns,
         "label_source": cfg.label_source,
         "label_topic": cfg.label_topic,
+        "frame_alignment_topic": "/robot/frame_alignment",
+        "training_goal_policy": "episode_final_arrival",
         "state_topics": cfg.state_topics,
         "rc_topics": cfg.rc_topics,
         "sensor_topics": cfg.sensor_topics,

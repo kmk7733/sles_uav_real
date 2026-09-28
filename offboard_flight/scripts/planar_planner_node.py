@@ -24,13 +24,12 @@ republishing the last setpoint and the vehicle hovers.
     Terminal B:  ROS_NAMESPACE=rogx2 python setpoint_buffer.py
 
 FRAMES
-The planner works in the grid's frame (vicon/world), because a planner must be
-in the same frame as the obstacles it is avoiding. mavros consumes the FCU's
-local ENU frame, which does not coincide with vicon/world -- EKF2 here is fed by
-the ZED, not by Vicon. The conversion happens at the last possible moment, in
-publish_reference(), and if the alignment is not established NO setpoint is
-emitted at all. Note that velocity and acceleration are rotated only
-(rotate_to_fcu), never translated.
+Mapper and planner consume the same EKF-derived pose in the configured world
+frame. ekf_world_align.py owns the fixed world <- fcu_local transform and
+publishes its validity/epoch on /robot/frame_alignment. This node rotates EKF
+linear velocity into world and uses the exact inverse for references. It never
+re-estimates that transform from the pose it just transformed. Invalid or stale
+alignment/state and mismatched-epoch maps withhold all commander setpoints.
 
 ROLL AND PITCH ARE NOT PLANNED
 The planner commands a planar acceleration. PX4 turns that into attitude. That
@@ -49,14 +48,14 @@ import numpy as np
 import rospy
 from scipy.ndimage import distance_transform_edt
 
-from geometry_msgs.msg import PoseStamped, TwistStamped, Point
+from geometry_msgs.msg import Pose, PoseStamped, TransformStamped, TwistStamped, Point
 from mavros_msgs.msg import PositionTarget
 from nav_msgs.msg import OccupancyGrid, Path
 from std_msgs.msg import String, Bool
 from visualization_msgs.msg import Marker, MarkerArray
 
 from guidance_library import Controller
-from haa_frames import WorldToFcu, yaw_from_quat
+from haa_frames import SharedFrameAlignment, planar_ekf_velocity, yaw_from_quat
 
 # THE PLANNER COMES FROM `planner/`, WHICH IS THE SIMULATOR'S OWN PACKAGE.
 # `catkin_ws/src/planner` is byte-identical to `planner/` in
@@ -143,7 +142,8 @@ class PlanarPlannerNode(object):
     def __init__(self):
         rospy.init_node("planar_planner_node")
         self.controller = Controller()
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+        self.plan_lock = threading.Lock()
 
         # ------------------------------------------------------------ params
         self.z0 = rospy.get_param("~z0", self.controller.takeoff_height)
@@ -195,10 +195,25 @@ class PlanarPlannerNode(object):
         self.r_eff = float(rospy.get_param("~r_eff",
                                            self.r_safe - self.r_quad))
 
-        self.pose_topic = rospy.get_param("~pose_topic", "/robot/pose_world")
+        self.pose_topic = rospy.get_param("~state_topic", "/robot/pose_world_epoch")
         self.grid_topic = rospy.get_param("~grid_topic", "/grid_map")
         self.require_map = rospy.get_param("~require_map", True)
         self.unknown_unsafe = rospy.get_param("~unknown_unsafe", True)
+        # MARGIN AROUND UNOBSERVED SPACE, and 0.0 is the simulator's value.
+        # `unknown_unsafe` makes an unknown cell untraversable; this decides
+        # whether its NEIGHBOURS are pushed back as well. r_safe is what it
+        # takes to clear a MEASURED surface -- r_perc is the error of a range
+        # reading, r_track the tube around a trajectory -- and unobserved space
+        # is a hole in the map, not a surface, so it earns none of them. The
+        # simulator has always run 0.0 (config.yaml:mapping.unknown_inflate,
+        # with the measurement beside the key: inflating unknown by even r_quad
+        # pushed the frontier back faster than the camera revealed it and a run
+        # that reached the goal in 10.9 s stalled 0.36 m short). This vehicle
+        # ran the other rule until 2026-09-06 only because planner/grid.py
+        # merged the two sets before its distance transform and could not
+        # express the sim's; on flight_20260906_054936 that cost 9.6-13.9
+        # percentage points of the arena.
+        self.unknown_inflate = float(rospy.get_param("~unknown_inflate", 0.0))
         self.occ_thresh = int(rospy.get_param("~occ_thresh", 50))
         self.clear_footprint = rospy.get_param("~clear_footprint", True)
 
@@ -214,17 +229,20 @@ class PlanarPlannerNode(object):
         self.plan_timeout = rospy.get_param("~plan_timeout", 0.5)
         self.max_step = rospy.get_param("~max_setpoint_step", 1.0)
         self.dry_run = rospy.get_param("~dry_run", False)
-        self.viz_frame = rospy.get_param("~viz_frame", "vicon/world")
+        self.viz_frame = rospy.get_param("~world_frame", rospy.get_param(
+            "/robot/world_frame", rospy.get_param("~viz_frame", "vicon/world")))
         # 0. The rollout cloud is 30 x 31 points rebuilt every tick, 2.6 ms,
         # and it is a picture of the SEARCH. What the vehicle actually did is
         # ~nominal_path, which costs 0.03 ms and stays on. Raise it to watch
         # the sampler.
         self.viz_rollouts = int(rospy.get_param("~viz_rollouts", 0))
 
-        self.align = WorldToFcu(
-            alpha=rospy.get_param("~align_alpha", 0.05),
-            min_updates=rospy.get_param("~align_min_updates", 10))
-        self.align_timeout = rospy.get_param("~align_timeout", 1.0)
+        self.alignment_topic = rospy.get_param(
+            "~alignment_topic", "/robot/frame_alignment")
+        self.align = SharedFrameAlignment(expected_world=self.viz_frame)
+        self.align_timeout = float(rospy.get_param("~align_timeout", 0.5))
+        self.state_timeout = float(rospy.get_param("~state_timeout", 0.5))
+        self.state_pair_max_age = float(rospy.get_param("~state_pair_max_age", 0.05))
 
         # --------------------------------------------------------- planner
         # THE SIMULATOR'S `limits_flown`, NOT ITS `limits:` BLOCK.
@@ -371,18 +389,25 @@ class PlanarPlannerNode(object):
 
         # ------------------------------------------------------------ state
         self.pose = None
-        self.fcu_pose = None
         self.twist = None
         self.ref = None            # last accepted FixedAltitudeReference
         self.ref_t0 = None
         self.a_prev = np.zeros(2)
         self.hold = None
+        self.ref_epoch = None
+        self.pose_epoch = None
+        self.map_epoch = None
+        self._epoch_start = None
+        self._needs_planner_reset = False
+        self._state_health = {}
+        self.arrived = False
+        self._goal_sent = None
 
         # ----------------------------------------------------------- ROS I/O
-        rospy.Subscriber(self.pose_topic, PoseStamped, self._pose_cb,
+        rospy.Subscriber(self.pose_topic, TransformStamped, self._pose_cb,
                          queue_size=1)
-        rospy.Subscriber("mavros/local_position/pose", PoseStamped,
-                         self._fcu_pose_cb, queue_size=1)
+        rospy.Subscriber(self.alignment_topic, String, self._alignment_cb,
+                         queue_size=1)
         rospy.Subscriber("mavros/local_position/velocity_local", TwistStamped,
                          self._twist_cb, queue_size=1)
         rospy.Subscriber(self.grid_topic, OccupancyGrid, self._grid_cb,
@@ -450,54 +475,94 @@ class PlanarPlannerNode(object):
 
     # ------------------------------------------------------------- callbacks
 
-    def _pose_cb(self, msg):
-        with self.lock:
-            self.pose = msg
-        self._try_align()
+    def _discard_epoch_locked(self):
+        """Drop frame-dependent state; reset the solver on its own thread."""
+        self.pose = self.twist = self.occ = None
+        self.pose_epoch = self.map_epoch = self.ref_epoch = None
+        self.ref = self.ref_t0 = self.hold = None
+        self.a_prev = np.zeros(2)
+        self.arrived = False
+        self._goal_sent = None
+        self._needs_planner_reset = True
 
-    def _fcu_pose_cb(self, msg):
+    def _alignment_cb(self, msg):
+        now = rospy.get_time()
         with self.lock:
-            self.fcu_pose = msg
-        self._try_align()
+            was_ready = self.align.ready
+            changed = self.align.update_status(msg.data, now=now)
+            if changed or (was_ready and not self.align.ready):
+                self._discard_epoch_locked()
+            self._epoch_start = self.align.valid_from
+            if not self.align.ready:
+                self._state_health = {"reason": self.align.reason,
+                                      "epoch": self.align.epoch}
+
+    def _pose_cb(self, msg):
+        now = rospy.get_time()
+        with self.lock:
+            if not self.align.is_ready(now=now, max_age=self.align_timeout):
+                return
+            if (msg.header.frame_id != self.align.world_frame or
+                    msg.child_frame_id != "ekf_body/epoch/" + self.align.epoch):
+                return
+            if (self._epoch_start is None or
+                    msg.header.stamp.to_sec() < self._epoch_start):
+                return
+            # The stamped Transform message carries epoch and measurement in
+            # one ROS message; the ordinary PoseStamped output is for legacy
+            # visualization/recording, not an authoritative planner input.
+            position = msg.transform.translation
+            pose = PoseStamped()
+            pose.header = msg.header
+            pose.pose = Pose(position=Point(x=position.x, y=position.y, z=position.z),
+                             orientation=msg.transform.rotation)
+            self.pose = pose
+            self.pose_epoch = self.align.epoch
 
     def _twist_cb(self, msg):
         with self.lock:
             self.twist = msg
 
-    def _try_align(self):
-        with self.lock:
-            w, f = self.pose, self.fcu_pose
-        if w is None or f is None:
-            return
-        qw, qf = w.pose.orientation, f.pose.orientation
-        self.align.update(
-            [w.pose.position.x, w.pose.position.y, w.pose.position.z],
-            yaw_from_quat(qw.x, qw.y, qw.z, qw.w), w.header.stamp.to_sec(),
-            [f.pose.position.x, f.pose.position.y, f.pose.position.z],
-            yaw_from_quat(qf.x, qf.y, qf.z, qf.w), f.header.stamp.to_sec())
-
     def _grid_cb(self, msg):
+        with self.lock:
+            now = rospy.get_time()
+            if not self.align.is_ready(now=now, max_age=self.align_timeout):
+                return
+            epoch = self.align.epoch
+            if (msg.header.frame_id != self.align.world_frame or
+                    self._epoch_start is None or
+                    msg.header.stamp.to_sec() < self._epoch_start or
+                    msg.info.map_load_time != rospy.Time.from_sec(self._epoch_start)):
+                return
         try:
+            # `occupied` and `unknown` now come from the object itself.
+            # This used to recover them from the raw message and assign them
+            # onto the instance, because planner/grid.py kept a single merged
+            # `unsafe` set and _publish_inflated needed to grow the WALLS
+            # without growing the unobserved region with them. That module
+            # carries the split now -- and, with unknown_inflate, applies it in
+            # clearance() as well, which the patch never could.
             occ = PlanarOccupancy.from_occupancy_grid_msg(
                 msg, occ_thresh=self.occ_thresh,
-                unknown_unsafe=self.unknown_unsafe)
-            # FOR THE OVERLAY ONLY, and attached here rather than asked of
-            # `planner/grid.py`. That module keeps one `unsafe` set by design
-            # and must stay byte-identical to the simulator's copy, so the
-            # occupied/unknown split -- which _publish_inflated needs to grow
-            # the WALLS without growing the unobserved region with them -- is
-            # recovered from the raw message in the ROS layer where it belongs.
-            v = np.asarray(msg.data, dtype=np.int16).reshape(
-                msg.info.height, msg.info.width)
-            occ.occupied = v >= int(self.occ_thresh)
-            occ.unknown = v < 0
+                unknown_unsafe=self.unknown_unsafe,
+                unknown_inflate=self.unknown_inflate,
+                r_safe=self.r_safe)
         except Exception as e:
             rospy.logwarn_throttle(5.0, "[planar] grid parse failed: %s", e)
             return
         with self.lock:
-            self.occ = occ
+            if (epoch == self.align.epoch and self.align.is_ready(
+                    now=rospy.get_time(), max_age=self.align_timeout)):
+                self.occ = occ
+                self.map_epoch = epoch
 
     def _goal_cb(self, msg):
+        # Empty legacy headers mean the configured world. Explicit frames
+        # must agree; there is no implicit ZED-map or FCU-local goal transform.
+        if msg.header.frame_id and msg.header.frame_id != self.viz_frame:
+            rospy.logwarn_throttle(2.0, "[planar] goal frame %s is not %s -- ignored",
+                                   msg.header.frame_id, self.viz_frame)
+            return
         with self.lock:
             self.goal = np.array([msg.pose.position.x, msg.pose.position.y])
             self.arrived = False        # a new goal un-latches the hold
@@ -506,33 +571,89 @@ class PlanarPlannerNode(object):
 
     # ------------------------------------------------------------------ state
 
-    def _current_state(self):
-        """Build a PlanarState from the latest pose and twist, or None."""
-        with self.lock:
-            pose, twist = self.pose, self.twist
-        if pose is None:
+    def _state_snapshot_locked(self, now):
+        """Matched EKF input and a fixed transform snapshot for one operation."""
+        if not self.align.is_ready(now=now, max_age=self.align_timeout):
+            # A heartbeat loss also retires cached commands until fresh input
+            # and a fresh map arrive; static transform creation age is irrelevant.
+            self._discard_epoch_locked()
+            self._state_health = {"reason": "alignment_unavailable",
+                                  "epoch": self.align.epoch}
             return None
-        p = pose.pose.position
-        q = pose.pose.orientation
-        yaw = yaw_from_quat(q.x, q.y, q.z, q.w)
-        if twist is not None:
-            vx, vy = twist.twist.linear.x, twist.twist.linear.y
-            omega = twist.twist.angular.z
-        else:
-            vx = vy = omega = 0.0
-        return PlanarState(p.x, p.y, vx, vy, yaw, omega)
+        pose, twist = self.pose, self.twist
+        if pose is None or twist is None or self.pose_epoch != self.align.epoch:
+            self._state_health = {"reason": "waiting_for_matched_ekf_state"}
+            return None
+        pose_stamp = pose.header.stamp.to_sec()
+        twist_stamp = twist.header.stamp.to_sec()
+        pose_age, twist_age = now - pose_stamp, now - twist_stamp
+        pair_age = abs(pose_stamp - twist_stamp)
+        self._state_health = {"epoch": self.align.epoch,
+                              "pose_stamp": pose_stamp, "twist_stamp": twist_stamp,
+                              "pose_age": pose_age, "twist_age": twist_age,
+                              "pair_age": pair_age}
+        if (not np.all(np.isfinite([pose_stamp, twist_stamp])) or
+                twist_stamp < self._epoch_start or
+                min(pose_age, twist_age) < -self.state_pair_max_age or
+                max(pose_age, twist_age) > self.state_timeout or
+                pair_age > self.state_pair_max_age):
+            self._state_health["reason"] = "stale_or_unmatched_ekf_state"
+            return None
+        align = self.align.snapshot()
+        p, q = pose.pose.position, pose.pose.orientation
+        linear = twist.twist.linear
+        values = [p.x, p.y, p.z, q.x, q.y, q.z, q.w,
+                  linear.x, linear.y, linear.z, twist.twist.angular.z]
+        if not np.all(np.isfinite(values)):
+            self._state_health["reason"] = "nonfinite_ekf_state"
+            return None
+        vx, vy, omega = planar_ekf_velocity(
+            align, [linear.x, linear.y, linear.z], twist.twist.angular.z)
+        state = PlanarState(p.x, p.y, vx, vy,
+                            yaw_from_quat(q.x, q.y, q.z, q.w), omega)
+        self._state_health["reason"] = "ready"
+        return state, align
+
+    def _current_state(self):
+        """Build a fresh, paired EKF state in the map frame, or None."""
+        with self.lock:
+            snapshot = self._state_snapshot_locked(rospy.get_time())
+            return None if snapshot is None else snapshot[0]
+
+    def _epoch_usable_locked(self, epoch, now):
+        return (self.align.epoch == epoch and
+                self.align.is_ready(now=now, max_age=self.align_timeout) and
+                (not self.require_map or
+                 (self.occ is not None and self.map_epoch == epoch)))
 
     # --------------------------------------------------------------- planning
 
     def plan_once(self, _evt=None):
-        state = self._current_state()
-        if state is None:
-            rospy.logwarn_throttle(2.0, "[planar] waiting for %s",
-                                   self.pose_topic)
+        if not self.plan_lock.acquire(False):
             return
+        try:
+            self._plan_once()
+        finally:
+            self.plan_lock.release()
 
+    def _plan_once(self):
         with self.lock:
+            snapshot = self._state_snapshot_locked(rospy.get_time())
+            if snapshot is None:
+                rospy.logwarn_throttle(2.0, "[planar] waiting for fresh paired EKF state")
+                self._publish_status("WAITING_EKF_STATE")
+                return
+            state, alignment = snapshot
+            epoch = alignment.epoch
+            if not self._epoch_usable_locked(epoch, rospy.get_time()):
+                rospy.logwarn_throttle(2.0, "[planar] waiting for current-epoch grid")
+                self._publish_status("WAITING_EPOCH_GRID")
+                return
+            if self._needs_planner_reset:
+                self.planner.reset()
+                self._needs_planner_reset = False
             occ, goal = self.occ, self.goal.copy()
+            a_prev = self.a_prev.copy()
 
         # ---------------------------------------------------- goal arrival
         # Checked BEFORE solving: once the goal is reached there is nothing to
@@ -540,25 +661,23 @@ class PlanarPlannerNode(object):
         # inside goal_tol. Latched, because ||p - goal|| dithers across the
         # tolerance and an unlatched test would flip in and out of hover.
         # Only a NEW goal clears it (see _goal_cb).
-        if self.arrived or self.planner.at_goal(state, goal):
-            if not self.arrived:
-                self.arrived = True
-                # Freeze the hover here. publish_reference() falls back to
-                # self.hold whenever self.ref is None, so this IS the hover.
-                self.hold = (state.x, state.y, state.psi)
-                rospy.loginfo("[planar] GOAL REACHED (%.2f, %.2f), err %.2f m "
-                              "<= goal_tol %.2f -- holding",
-                              state.x, state.y,
-                              float(np.hypot(state.x - goal[0],
-                                             state.y - goal[1])),
-                              self.planner.goal_tol)
-            self.ref = None
-            self.pub_arrived.publish(Bool(data=True))
-            self._publish_goal(goal)
-            self._publish_status("ARRIVED holding (%.2f, %.2f)"
-                                 % (self.hold[0], self.hold[1]))
-            return
-        self.pub_arrived.publish(Bool(data=False))
+        with self.lock:
+            if not self._epoch_usable_locked(epoch, rospy.get_time()):
+                return
+            if self.arrived or self.planner.at_goal(state, goal):
+                if not self.arrived:
+                    self.arrived = True
+                    self.hold = (state.x, state.y, state.psi)
+                    rospy.loginfo("[planar] GOAL REACHED (%.2f, %.2f) -- holding",
+                                  state.x, state.y)
+                self.ref = self.ref_t0 = None
+                self.ref_epoch = epoch
+                self.pub_arrived.publish(Bool(data=True))
+                self._publish_goal(goal)
+                self._publish_status("ARRIVED holding (%.2f, %.2f)"
+                                     % (self.hold[0], self.hold[1]))
+                return
+            self.pub_arrived.publish(Bool(data=False))
 
         if self.require_map:
             if occ is None:
@@ -576,32 +695,38 @@ class PlanarPlannerNode(object):
             self.validator.occ = self.free
 
         t0 = rospy.get_time()
-        res = self.planner.plan(state, goal, a_prev=self.a_prev,
+        res = self.planner.plan(state, goal, a_prev=a_prev,
                                 n_viz=self.viz_rollouts)
         solve_ms = (rospy.get_time() - t0) * 1000.0
 
-        if not res.ok:
-            rospy.logerr_throttle(1.0, "[planar] %s (%s) -> holding",
-                                  res.status, res.reason)
-            self.ref = None
-            self._publish_status("%s %s solve=%.0fms"
-                                 % (res.status, res.reason, solve_ms))
-            return
-
-        if res.degraded:
-            rospy.logwarn_throttle(1.0, "[planar] degraded: %s (%s)",
-                                   res.status, res.reason)
-
-        self.ref = res.reference.lift(self.z0)
-        self.ref_t0 = rospy.get_time()
-        self.a_prev = res.reference.a[0].copy()
+        with self.lock:
+            if not self._epoch_usable_locked(epoch, rospy.get_time()):
+                # Callbacks never mutate the solver while it is running.
+                self._needs_planner_reset = True
+                return
+            if not res.ok:
+                rospy.logerr_throttle(1.0, "[planar] %s (%s) -> holding",
+                                      res.status, res.reason)
+                self.ref = self.ref_t0 = None
+                self.ref_epoch = epoch
+                self._publish_status("%s %s solve=%.0fms"
+                                     % (res.status, res.reason, solve_ms))
+                return
+            if res.degraded:
+                rospy.logwarn_throttle(1.0, "[planar] degraded: %s (%s)",
+                                       res.status, res.reason)
+            ref = res.reference.lift(self.z0)
+            self.ref = ref
+            self.ref_t0 = rospy.get_time()
+            self.ref_epoch = epoch
+            self.a_prev = res.reference.a[0].copy()
 
         # TIMED, because these run on the solve's own thread and a subscriber
         # appearing -- a rosbag, a Foxglove panel -- is enough to switch them
         # on. Without this in the status line, "the planner got slower when I
         # started recording" is invisible.
         t1 = rospy.get_time()
-        self._publish_path(self.ref)
+        self._publish_path(ref)
         self._publish_rollouts(res.X_viz)
         self._publish_goal(goal)
         self._publish_inflated(occ)
@@ -610,7 +735,7 @@ class PlanarPlannerNode(object):
         self._publish_status(
             "%s valid=%d/%d beta=%.3g cost=%.1f solve=%.0fms viz=%.0fms | %s %s"
             % (res.status, res.n_valid, res.n_samples, res.beta, res.cost,
-               solve_ms, viz_ms, self.align.describe(), res.reason))
+               solve_ms, viz_ms, "alignment_epoch=%s" % epoch, res.reason))
         if viz_ms > 0.15 * solve_ms and viz_ms > 5.0:
             rospy.logwarn_throttle(
                 10.0, "[planar] visualisation is %.0f ms of a %.0f ms tick -- "
@@ -626,57 +751,52 @@ class PlanarPlannerNode(object):
     # ------------------------------------------------------------- publishing
 
     def publish_reference(self, _evt=None):
-        """Sample the plan at the elapsed time and emit it to the controller."""
+        """Emit a reference only while its state, map and alignment agree."""
         if self.dry_run:
             return
-        state = self._current_state()
-        if state is None:
-            return
-
-        if self.hold is None:
-            self.hold = (state.x, state.y, state.psi)
-
-        ref, t0 = self.ref, self.ref_t0
-        pt = None
-        if ref is not None and t0 is not None:
-            age = rospy.get_time() - t0
-            if age <= self.plan_timeout:
-                pt = ref.sample(age)
+        # This short critical section prevents an epoch reset between the
+        # inverse transform and publication. Solves run outside this lock.
+        with self.lock:
+            now = rospy.get_time()
+            snapshot = self._state_snapshot_locked(now)
+            if snapshot is None:
+                return
+            state, alignment = snapshot
+            if not self._epoch_usable_locked(alignment.epoch, now):
+                return
+            if self.ref_epoch is not None and self.ref_epoch != alignment.epoch:
+                self.ref = self.ref_t0 = self.hold = None
+                return
+            if self.hold is None:
+                self.hold = (state.x, state.y, state.psi)
+            ref, t0 = self.ref, self.ref_t0
+            pt = None
+            if ref is not None and t0 is not None:
+                age = now - t0
+                if 0.0 <= age <= self.plan_timeout:
+                    pt = ref.sample(age)
+                else:
+                    rospy.logwarn_throttle(2.0, "[planar] plan stale (%.2fs) -> holding", age)
+            if pt is None:
+                p = np.array([self.hold[0], self.hold[1], self.z0])
+                v, a = np.zeros(3), np.zeros(3)
+                yaw, yaw_rate = self.hold[2], 0.0
             else:
-                rospy.logwarn_throttle(2.0, "[planar] plan stale (%.2fs) -> "
-                                            "holding", age)
-
-        if pt is None:
-            # No usable plan: hold position, zero feedforward. Not the braking
-            # trajectory -- that is the planner's job and it already tried.
-            p = np.array([self.hold[0], self.hold[1], self.z0])
-            v = np.zeros(3)
-            a = np.zeros(3)
-            yaw, yaw_rate = self.hold[2], 0.0
-        else:
-            p, v, a = pt.p.copy(), pt.v.copy(), pt.a.copy()
-            yaw, yaw_rate = pt.psi, pt.psi_dot
-            self.hold = (p[0], p[1], yaw)
-
-        p = self._limit(p, state)
-
-        if not self.align.ready:
-            rospy.logwarn_throttle(2.0, "[planar] no world->FCU alignment "
-                                        "(%d pairs) -- withholding setpoint",
-                                   self.align.n_updates)
-            return
-        if self.align.age(rospy.get_time()) > self.align_timeout:
-            rospy.logwarn_throttle(2.0, "[planar] alignment stale -- "
-                                        "withholding setpoint")
-            return
-
-        p_fcu, yaw_fcu = self.align.to_fcu(p, yaw)
-        v_fcu = self.align.rotate_to_fcu(v)       # free vectors: rotate only,
-        a_fcu = self.align.rotate_to_fcu(a)       # never translate
-
-        self.pub_sp.publish(
-            self.controller.construct_target_full(p_fcu, v_fcu, a_fcu,
-                                                  yaw_fcu, yaw_rate))
+                p, v, a = pt.p.copy(), pt.v.copy(), pt.a.copy()
+                yaw, yaw_rate = pt.psi, pt.psi_dot
+                self.hold = (p[0], p[1], yaw)
+            p = self._limit(p, state)
+            p_fcu, yaw_fcu = alignment.world_to_local(p, yaw)
+            v_fcu = alignment.rotate_to_local(v)
+            a_fcu = alignment.rotate_to_local(a)
+            command = self.controller.construct_target_full(
+                p_fcu, v_fcu, a_fcu, yaw_fcu, yaw_rate)
+            # Internal commander contract: the versioned local frame identifies
+            # the transform used for this command even across callback ordering.
+            # mission_node validates it and restores fcu_local before MAVROS.
+            command.header.frame_id = (alignment.local_frame + "/epoch/" +
+                                       alignment.epoch)
+            self.pub_sp.publish(command)
 
     def _limit(self, p, state):
         """Bound how far the emitted setpoint may sit from the vehicle."""
@@ -690,6 +810,8 @@ class PlanarPlannerNode(object):
         return np.array([p[0], p[1], self.z0])
 
     def _publish_path(self, ref):
+        if self.pub_path.get_num_connections() == 0:
+            return
         path = Path()
         path.header.stamp = rospy.Time.now()
         path.header.frame_id = self.viz_frame
@@ -889,12 +1011,19 @@ class PlanarPlannerNode(object):
             "safety": {"r_quad": self.r_quad, "r_perc": self.r_perc,
                        "r_track": self.r_track, "d_clr": self.d_clr,
                        "r_safe": self.r_safe,
-                       "unknown_unsafe": self.unknown_unsafe},
+                       "unknown_unsafe": self.unknown_unsafe,
+                       "unknown_inflate": self.unknown_inflate},
             "goal": [float(self.goal[0]), float(self.goal[1])],
             "rates": {"plan_rate": self.plan_rate, "pub_rate": self.pub_rate,
                       "plan_timeout": self.plan_timeout},
             "z0": self.z0, "dry_run": self.dry_run,
             "grid_topic": self.grid_topic, "pose_topic": self.pose_topic,
+            "state_adapter": {"source": "mavros_ekf", "angular_z": "preserved",
+                              "alignment_topic": self.alignment_topic,
+                              "alignment": "fixed_shared_W_from_L",
+                              "state_timeout": self.state_timeout,
+                              "pair_max_age": self.state_pair_max_age,
+                              "alignment_timeout": self.align_timeout},
         }
         self.pub_config.publish(String(data=json.dumps(cfg, sort_keys=True)))
         rospy.loginfo("[planar] producer=%s planner=%s git=%s%s",
@@ -902,21 +1031,15 @@ class PlanarPlannerNode(object):
                       " (planner/ DIRTY)" if dirty else "")
 
     def _publish_status(self, text):
-        self.pub_status.publish(String(data=text))
+        with self.lock:
+            health = dict(self._state_health)
+        self.pub_status.publish(String(data=text + " | ekf=" +
+                                      json.dumps(health, sort_keys=True)))
 
     # --------------------------------------------------------------- run loop
 
     def start(self):
-        rospy.loginfo("[planar] waiting for %s ...", self.pose_topic)
-        while not rospy.is_shutdown() and self.pose is None:
-            rospy.sleep(0.1)
-        rospy.loginfo("[planar] pose acquired")
-        if not self.dry_run:
-            rospy.loginfo("[planar] waiting for world->FCU alignment ...")
-            while not rospy.is_shutdown() and not self.align.ready:
-                rospy.sleep(0.1)
-            rospy.loginfo("[planar] %s", self.align.describe())
-
+        rospy.loginfo("[planar] waiting for EKF pose, velocity, shared alignment and grid")
         rospy.Timer(rospy.Duration(1.0 / self.plan_rate), self.plan_once)
         rospy.Timer(rospy.Duration(1.0 / self.pub_rate), self.publish_reference)
         rospy.spin()

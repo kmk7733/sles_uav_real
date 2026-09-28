@@ -2,10 +2,10 @@
 <!--
   2D occupancy grid in the VICON WORLD frame.
 
-  vicon_map_align reads the robot's initial pose from /vicon/ROGX2/ROGX2 once at
-  startup and latches a static TF  vicon/world -> map  (ZED tracking frame).
-  From then on the ZED (map->base_link) carries localization; depth_to_grid
-  builds /grid_map directly in vicon/world through that TF chain.
+  With start_grid=true, mapping and planning use EKF body pose transformed
+  by ekf_world_align's fixed world<-fcu_local alignment.
+  With start_grid=false, data collection keeps the original vicon_map_align
+  and ZED pose-to-world path, without a mapper or EKF alignment dependency.
 
   Prereqs already running (script_startup.sh): ZED wrapper under /rogx2,
   vicon_bridge (or pass start_vicon:=true to start it here).
@@ -19,14 +19,16 @@
     <!-- pointcloud | andert | both. See zed_depth_grid.launch; `both` runs the
          two mappers on separate topics for an A/B on matched header stamps,
          and the planner keeps reading grid_topic throughout. -->
-    <arg name="mapper"            default="pointcloud" />
+    <arg name="mapper"            default="andert" />
     <arg name="grid_topic"        default="/grid_map" />
     <arg name="grid_topic_andert" default="/grid_map_andert" />
     <arg name="decim"             default="2" />
-    <arg name="row_decim"         default="0" />
-    <arg name="rays_per_col"      default="8" />
+    <arg name="row_decim"         default="4" />
+    <arg name="rays_per_col"      default="2" />
     <arg name="map_hz"            default="10.0" />
     <arg name="start_vicon"  default="false" />
+    <!-- start_grid=false preserves the original ZED/Vicon recording path. -->
+    <arg name="start_grid"   default="true" />
     <arg name="vicon_topic"  default="/vicon/ROGX2/ROGX2" />
     <!-- NO leading slash (tf2 convention). vicon_rogx.launch broadcasts the
          same slash-less name, so TF and message frames match everywhere,
@@ -36,6 +38,22 @@
     <arg name="yaw_only"     default="true" />
     <!-- Vicon-subject -> drone-body mount rotation (from attitude calibration) -->
     <arg name="mount_calib"  default="$(find mpc_controller)/config/mount_calib.json" />
+    <arg name="pose_in" if="$(arg start_grid)"
+         default="/rogx2/mavros/local_position/pose" />
+    <arg name="pose_in" unless="$(arg start_grid)"
+         default="/rogx2/zed2i/zed_node/pose" />
+    <arg name="pose_out" default="/robot/pose_world" />
+    <arg name="pose_epoch_out" default="/robot/pose_world_epoch" />
+    <arg name="fcu_state_topic" default="/rogx2/mavros/state" />
+    <arg name="local_frame" default="fcu_local" />
+    <arg name="alignment_topic" default="/robot/frame_alignment" />
+    <arg name="alignment_max_age" default="0.5" />
+    <arg name="start_alignment" default="true" />
+    <arg name="start_pose_adapter" default="true" />
+    <arg name="resolution" default="0.05" />
+    <arg name="max_range" default="6.0" />
+    <arg name="publish_wedge" default="true" />
+    <arg name="publish_footprint" default="true" />
 
     <!-- grid extents in the VICON world frame (m) = fixed room coordinates.
          7 x 5 m map, 7 m on x and 5 m on y. NOT centred on the vicon origin:
@@ -55,26 +73,43 @@
     <include if="$(arg start_vicon)"
              file="$(find vicon_bridge)/launch/vicon_rogx.launch" />
 
-    <node name="vicon_map_align" pkg="zed_rtabmap_example"
-          type="vicon_map_align.py" output="screen">
-        <param name="vicon_topic" value="$(arg vicon_topic)" />
-        <param name="world_frame" value="$(arg world_frame)" />
-        <param name="yaw_only"    value="$(arg yaw_only)" />
-        <param name="mount_calib" value="$(arg mount_calib)" />
-    </node>
+    <!-- Original data-collection localization, independent of EKF readiness. -->
+    <group unless="$(arg start_grid)">
+        <node if="$(arg start_alignment)" name="vicon_map_align"
+              pkg="zed_rtabmap_example" type="vicon_map_align.py" output="screen">
+            <param name="vicon_topic" value="$(arg vicon_topic)" />
+            <param name="world_frame" value="$(arg world_frame)" />
+            <param name="yaw_only" value="$(arg yaw_only)" />
+            <param name="mount_calib" value="$(arg mount_calib)" />
+        </node>
+        <node if="$(arg start_pose_adapter)" name="pose_to_world"
+              pkg="zed_rtabmap_example" type="pose_to_world_zed.py" output="screen">
+            <remap from="~pose_in" to="$(arg pose_in)" />
+            <remap from="~pose_out" to="$(arg pose_out)" />
+            <param name="world_frame" value="$(arg world_frame)" />
+        </node>
+    </group>
 
-    <!-- localization pose re-expressed in the world frame (same frame as
-         /grid_map) for consumers like mpc_node that don't use TF -->
-    <arg name="pose_in"  default="/rogx2/zed2i/zed_node/pose" />
-    <arg name="pose_out" default="/robot/pose_world" />
-    <node name="pose_to_world" pkg="zed_rtabmap_example"
-          type="pose_to_world.py" output="screen">
-        <remap from="~pose_in"  to="$(arg pose_in)" />
-        <remap from="~pose_out" to="$(arg pose_out)" />
-        <param name="world_frame" value="$(arg world_frame)" />
-    </node>
-
-    <include file="$(find zed_rtabmap_example)/launch/zed_depth_grid.launch">
+    <!-- The MPPI/grid path retains the common EKF alignment and pose adapter. -->
+    <include if="$(arg start_grid)"
+             file="$(find zed_rtabmap_example)/launch/zed_depth_grid.launch">
+        <arg name="alignment_mode" value="vicon" />
+        <arg name="start_grid" value="$(arg start_grid)" />
+        <arg name="start_alignment" value="$(arg start_alignment)" />
+        <arg name="start_pose_adapter" value="$(arg start_pose_adapter)" />
+        <arg name="alignment_topic" value="$(arg alignment_topic)" />
+        <arg name="alignment_max_age" value="$(arg alignment_max_age)" />
+        <arg name="local_frame" value="$(arg local_frame)" />
+        <arg name="pose_in" value="$(arg pose_in)" />
+        <arg name="pose_out" value="$(arg pose_out)" />
+        <arg name="pose_epoch_out" value="$(arg pose_epoch_out)" />
+        <arg name="fcu_state_topic" value="$(arg fcu_state_topic)" />
+        <arg name="vicon_topic" value="$(arg vicon_topic)" />
+        <arg name="mount_calib" value="$(arg mount_calib)" />
+        <arg name="resolution" value="$(arg resolution)" />
+        <arg name="max_range" value="$(arg max_range)" />
+        <arg name="publish_wedge" value="$(arg publish_wedge)" />
+        <arg name="publish_footprint" value="$(arg publish_footprint)" />
         <arg name="camera_model"        value="$(arg camera_model)" />
         <arg name="open_rviz"           value="$(arg open_rviz)" />
         <arg name="world_frame"         value="$(arg world_frame)" />

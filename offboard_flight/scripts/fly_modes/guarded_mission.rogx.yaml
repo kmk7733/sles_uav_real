@@ -1,0 +1,32 @@
+# guarded_mission_node parameters for fly_haa.sh / fly_hpa.sh / fly_desimplex.sh.
+# Loaded into /rogx2/guarded_mission_node; session_id is set per run by the script.
+# Values and their source (mission_node.py / preflight.py defaults unless stated).
+auto_start: false
+require_frame_alignment: true
+sp_topic: commander/set_pose_safe
+safe_topic: commander/set_pose_safe
+nominal_topic: commander/set_pose
+guard_topic: commander/collision_stop_status
+execution_topic: commander/collision_stop_execution
+alignment_topic: /robot/frame_alignment
+stop_policy: settled_velocity
+# StopBeforeCollision: after the frozen hold, AUTO.LAND once PX4 3D speed stays
+# at or below 0.1 m/s for 1.0 s (operator decision 2026-09-25; cruise was ~0.5 m/s).
+stop_speed_threshold: 0.1
+stop_settle_seconds: 1.0
+# velocity_local arrives at ~30 Hz; a sample older than / gap longer than the
+# mission pose timeout (0.5 s) breaks the dwell.
+stop_velocity_timeout: 0.5
+# Guard heartbeat: the only way the mission knows StopBeforeCollision is alive
+# during takeoff/hover/landing, when no planner command flows. 0.5 s = sp_timeout.
+guard_timeout: 0.5
+# Allowed amount the guard status stamp may lead this clock (same host); same
+# -0.05 s tolerance mission_node applies to setpoint stamps.
+future_tolerance: 0.05
+# MAVROS state is published at 1 Hz; preflight.py allows 2.0 s receipt age.
+mav_timeout: 2.0
+pose_timeout: 0.5          # mission_node ~pose_timeout
+alignment_timeout: 0.5     # mission_node ~alignment_timeout
+sp_timeout: 0.5            # mission_node ~sp_timeout
+land_retry_interval: 0.5   # mission_node repeats AUTO.LAND every 0.5 s
+land_max_attempts: 20      # = mission_node land_timeout 10 s / 0.5 s; exhaustion keeps the hold

@@ -16,7 +16,36 @@
 #   RECORD=0 fly.sh          do not start the bag (it is on by default -- a
 #                            flight you cannot look at afterwards is a flight
 #                            you have to fly again)
-#   RECORD=depth fly.sh      bag profile: light (default) | depth | full
+#   RECORD=depth fly.sh      bag profile: light | depth | full | dataset
+#                            SOURCE=mppi defaults to light, SOURCE=external to
+#                            dataset -- the only profile that carries stereo
+#                            RGB, depth and the label odometry, i.e. the only
+#                            one extract_flight_dataset.py can read. It writes
+#                            ~/drone_data/session_<ts>/ instead of ~/bags/.
+#
+# WHERE THE SETPOINTS COME FROM
+#   SOURCE=mppi fly.sh       the live planar planner on this machine (default)
+#   SOURCE=external fly.sh   NOTHING is started to produce them. commander/
+#                            set_pose is expected from somewhere else -- in
+#                            practice the GCS streaming a drawn trajectory:
+#
+#     # on the GCS, against THIS master
+#     rosmode real
+#     ROS_NAMESPACE=rogx2 rosrun vicon_traj path_generator.py <traj> \
+#         --transform ~/drone_data/frames/world_to_local.yaml
+#
+#   Everything else is identical -- mission_node, the bag, go/land/state/stop
+#   -- because mission_node only ever consumed a topic, and does not care who
+#   fills it. Two things do change:
+#     * the /grid_map preflight check is skipped. A run that does not consume
+#       the map does not need the mapper, and requiring it would refuse a
+#       perfectly valid flight.
+#     * nothing here can tell you the source is alive. mission_node's
+#       ~sp_timeout does: silence for 0.5 s is HOLD.
+#
+#   To put the Vicon safety supervisor in between, point mission_node at its
+#   output instead -- no change here, MISSION_ARGS already reaches it:
+#     SOURCE=external MISSION_ARGS="_sp_topic:=commander/set_pose_safe" fly.sh
 #
 # THE MAPPER IS NOT STARTED HERE. Run ~/catkin_ws/src/perception/restart_stack.sh
 # first (or `~/start_test_grid.sh vicon`) and confirm /grid_map is publishing;
@@ -102,13 +131,68 @@ SRV=/${NS}/mission_node
 #
 # Replanning DISTANCE is what matters and 5 Hz at v_max 0.31 m/s is 6.2 cm per
 # cycle against a 3.0 s / 0.93 m horizon.
-PLANNER_ARGS=${PLANNER_ARGS:-"_plan_rate:=5"}
+# HORIZON 60, WHICH IS WHAT v4 ACTUALLY FLEW AND config.yaml's 30 IS NOT.
+# `experiments/haa_vs_hpa.py` carries `--haa-horizon` with a DEFAULT OF 60 and
+# overrides config.yaml with it, so every HAA arm in runs/test40_c10b512 -- the
+# whole v4 comparison -- ran a 6.0 s lookahead while this node ran 3.0 s. It is
+# printed in that run's own log: `[HAA] ... horizon 60 -> reach 2.10 m`.
+#
+# It is not only the lookahead. sigma is DERIVED from the horizon --
+# spread = dt*sqrt(N) in mppi_sigma() -- so halving N widens the search:
+#
+#     horizon 60   sigma = [0.216, 0.216, 0.341]     <- v4
+#     horizon 30   sigma = [0.306, 0.306, 0.482]     <- what flew, +41% on yaw
+#
+# Measured on this box 2026-09-08, novicon grid 224x204, geodesic on, K=192:
+#
+#     H30  solve p50 199  p95 232 ms  ->  4.92 Hz
+#     H60  solve p50 233  p95 275 ms  ->  4.16 Hz
+#
+# The geodesic is ~100 ms of that and is horizon-INDEPENDENT (grid-wide
+# Dijkstra); MPPI proper goes 94 -> 135 ms, which is the horizon. On the
+# vicon-aligned 144x104 grid the geodesic term is ~3x cheaper, so H60 should
+# land near 170 ms p50 against the 200 ms budget -- confirmed only when Vicon
+# is back on. Re-measure before trusting it.
+# Runtime target after the exact Python mapper/MPPI optimizations.
+# Historical timings above predate these changes; K=192 and horizon=60 remain.
+PLANNER_ARGS=${PLANNER_ARGS:-"_plan_rate:=10 _horizon:=60"}
 GOAL_X=${GOAL_X:-2.0}
 GOAL_Y=${GOAL_Y:-0.0}
 MISSION_ARGS=${MISSION_ARGS:-""}
 
-RECORD=${RECORD:-light}
+SOURCE=${SOURCE:-mppi}
+
+# SOURCE=external IS the data-collection flight -- a GCS-drawn path flown to
+# sample the room -- so it defaults to the profile that can actually become a
+# dataset. `light` records no imagery and no label odometry; the 09-08 flight
+# was recorded that way and yielded zero training samples.
+RECORD=${RECORD:-$([ "$SOURCE" = external ] && echo dataset || echo light)}
 [ "$RECORD" = "1" ] && RECORD=light
+case "$SOURCE" in
+    mppi|external) ;;
+    *) echo "SOURCE=$SOURCE -- expected 'mppi' or 'external'"; exit 1 ;;
+esac
+# External flights require FCU + local pose + the original world pose.
+# Grid and MPPI's EKF alignment/epoch metadata are not flight inputs here.
+#
+# Both come out of zed_vicon_grid.launch, but from SEPARATE nodes -- and they
+# are needed for different reasons:
+#
+#   /grid_map          consumed only by the onboard MPPI planner. An
+#                      externally-sourced flight never reads it, so requiring
+#                      it would refuse a valid run because the mapper is down.
+#
+#   /robot/pose_world  The data-collection launch preserves the ZED pose put
+#                      through vicon_map_align's fixed world transform. Raw
+#                      EKF odometry is also recorded by the dataset profile.
+#
+# --optional, not --skip: an optional topic is still subscribed and still
+# reported, because whether it is up decides what lands in the bag.
+#
+# To fly with no mapper at all, ask for it explicitly and know what it costs:
+#   PREFLIGHT_ARGS="--optional /robot/pose_world" \
+#       SOURCE=external fly.sh
+PREFLIGHT_ARGS="${PREFLIGHT_ARGS:-}"
 
 _kill_flight_nodes() {
     pkill -f planar_planner_node 2>/dev/null
@@ -136,22 +220,48 @@ start)
     # ONE node, not one per topic. Each `rostopic echo` pays a full node
     # registration before it can hear anything, and against /mavros/state at
     # 1 Hz a few seconds of budget loses that race and reports NO DATA on a
-    # healthy link. preflight.py subscribes to all four at once.
+    # healthy link. preflight.py subscribes to all required topics at once.
     echo "pre-flight:"
-    if ! python3 "$SCRIPTS/preflight.py"; then
+    if ! python3 "$SCRIPTS/preflight.py" $PREFLIGHT_ARGS --profile "$SOURCE"; then
         echo "  refusing to start the planner until those are up"
         exit 1
+    fi
+
+    # The alignment owner selects vicon/world or plan_world before this check.
+    # Goals and all reference metadata use the same world as the mapper.
+    if [ "$SOURCE" = mppi ]; then
+        WORLD_FRAME=$(rosparam get /robot/world_frame 2>/dev/null)
+        if [ -z "$WORLD_FRAME" ]; then
+            echo "no EKF world frame -- restart the grid stack with the new alignment node"
+            exit 1
+        fi
     fi
 
     _kill_flight_nodes
     cd "$SCRIPTS" || exit 1
 
-    ROS_NAMESPACE=$NS nohup python3 -u planar_planner_node.py \
-        _dry_run:=false _goal_x:=${GOAL_X} _goal_y:=${GOAL_Y} \
-        $PLANNER_ARGS > /tmp/planner_live.log 2>&1 &
-    echo "planner  pid $!  -> /tmp/planner_live.log"
+    if [ "$SOURCE" = mppi ]; then
+        ROS_NAMESPACE=$NS nohup python3 -u planar_planner_node.py \
+            _dry_run:=false _world_frame:=${WORLD_FRAME} _goal_x:=${GOAL_X} _goal_y:=${GOAL_Y} \
+            $PLANNER_ARGS > /tmp/planner_live.log 2>&1 &
+        echo "planner  pid $!  -> /tmp/planner_live.log"
+    else
+        echo "planner  NOT STARTED (SOURCE=external)"
+        echo "         commander/set_pose must come from somewhere else, or"
+        echo "         mission_node will sit in HOLD on ~sp_timeout."
+        # Worth saying out loud: preflight checked the FCU link and the EKF2
+        # pose and nothing else. It has never checked Vicon -- the onboard
+        # planner does not read it -- and an externally-sourced flight usually
+        # depends on it completely, through both the drawn path and the
+        # supervisor. That check lives on the GCS, not here.
+        echo "         NOTE: preflight does NOT check Vicon. Confirm it there:"
+        echo "               ./fly_real.sh -c      (or -d, with no FCU)"
+    fi
 
+    FRAME_REQUIRED=false
+    [ "$SOURCE" = mppi ] && FRAME_REQUIRED=true
     ROS_NAMESPACE=$NS nohup python3 -u mission_node.py \
+        _require_frame_alignment:=${FRAME_REQUIRED} \
         $MISSION_ARGS > /tmp/mission.log 2>&1 &
     echo "mission  pid $!  -> /tmp/mission.log"
 
@@ -167,9 +277,26 @@ start)
         echo "bag      NOT RECORDING (RECORD=0)"
     fi
 
-    echo "waiting for the world->FCU alignment ..."
-    sleep 25
-    grep -a "world->FCU\|r_safe=0\|cost:" /tmp/planner_live.log | tail -3
+    if [ "$SOURCE" = mppi ]; then
+        echo "shared EKF alignment ready; waiting for the first planner status ..."
+        sleep 5
+        grep -a "alignment\|r_safe=0\|cost:" /tmp/planner_live.log | tail -3
+    else
+        # There is no planner log to wait on. What matters instead is whether
+        # the external source has actually appeared, so say that -- and say it
+        # about the topic mission_node is really reading, which MISSION_ARGS
+        # may have moved.
+        sleep 5
+        SP_TOPIC=$(echo "$MISSION_ARGS" | sed -n 's/.*_sp_topic:=\([^ ]*\).*/\1/p')
+        SP_TOPIC=/${NS}/${SP_TOPIC:-commander/set_pose}
+        printf "setpoints on %s: " "$SP_TOPIC"
+        if timeout 4 rostopic echo -n1 "$SP_TOPIC" >/dev/null 2>&1; then
+            echo "arriving"
+        else
+            echo "NONE YET -- start the source before 'go', or mission_node"
+            echo "  will climb and then HOLD on ~sp_timeout."
+        fi
+    fi
     echo
     grep -a "\[mission\]" /tmp/mission.log | tail -4
     echo

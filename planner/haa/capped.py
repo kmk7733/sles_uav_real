@@ -132,8 +132,9 @@ import numpy as np
 # reimplemented on purpose: its exact copy-vs-view behaviour IS the mutation
 # contract above. A local three-line copy would be a second definition of the
 # thing this class depends on, free to drift from the original.
-from planner.dynamics import PlanarDynamics, _as_batch
-from planner.types import IAL, IOM, NXI, S_VEL, U_ACC
+from planner.dynamics import (PlanarDynamics, _as_batch, _norm_last_axis,
+                              _scalar_range_ok, _SCALAR_MAGNITUDE_LIMIT)
+from planner.types import IAL, IOM, IPSI, NXI, S_VEL, U_ACC
 
 
 class CappedDynamics(PlanarDynamics):
@@ -159,6 +160,26 @@ class CappedDynamics(PlanarDynamics):
         dt = self.dt
         v_max = float(self.lim.v_max)
         om_max = float(self.lim.omega_max)
+
+        if (K == 1 and U.shape[2] == 3
+                and getattr(self.step, "__func__", None) is PlanarDynamics.step
+                and 1e-50 <= dt <= _SCALAR_MAGNITUDE_LIMIT
+                and 0.0 <= v_max <= _SCALAR_MAGNITUDE_LIMIT
+                and 0.0 <= om_max <= _SCALAR_MAGNITUDE_LIMIT
+                and N <= 1000000
+                and _scalar_range_ok(U) and _scalar_range_ok(X[:, 0, :])):
+            return self._rollout_singleton(X, U, dt, v_max, om_max)
+
+        if (K > 1 and U.shape[2] == 3
+                and (U.flags.c_contiguous or U.flags.f_contiguous)
+                and U.flags.writeable
+                and getattr(self.step, "__func__", None) is PlanarDynamics.step
+                and 1e-50 <= dt <= _SCALAR_MAGNITUDE_LIMIT
+                and 0.0 <= v_max <= _SCALAR_MAGNITUDE_LIMIT
+                and 0.0 <= om_max <= _SCALAR_MAGNITUDE_LIMIT
+                and N <= 1000000
+                and _scalar_range_ok(U) and _scalar_range_ok(X[:, 0, :])):
+            return self._rollout_batch(X, U, dt, v_max, om_max)
 
         for k in range(N):
             xk = X[:, k, :]
@@ -189,6 +210,100 @@ class CappedDynamics(PlanarDynamics):
             # AFTER the projection, so position integrates the applied input.
             X[:, k + 1, :] = self.step(xk, U[:, k, :])
 
+        return X
+
+    @staticmethod
+    def _rollout_batch(X, U, dt, v_max, om_max):
+        """Group equal integrator operations while keeping every step in order.
+
+        r = [x, y, psi] and q = [vx, vy, omega] use the same three-channel
+        multiply/add operations with U = [ax, ay, alpha]. Their components
+        retain the original operation order, and only psi is wrapped. Packing
+        the channels avoids separate tiny calls for translation and heading.
+
+        A contiguous time-major input copy keeps each step's samples adjacent.
+        The applied inputs are copied back into the caller's U before returning;
+        X is filled in its original C-order layout. Read-only or overlapping
+        input storage and custom step methods retain the generic rollout.
+        """
+        K, N = U.shape[:2]
+        half = 0.5 * dt * dt
+        work_u = np.ascontiguousarray(U.transpose(1, 0, 2))
+        r = np.ascontiguousarray(X[:, 0, :][:, [0, 1, IPSI]])
+        q = np.ascontiguousarray(X[:, 0, :][:, [2, 3, IOM]])
+        for k in range(N):
+            uk = work_u[k]
+            q_new = q + dt * uk
+            v, v_new = q[:, :2], q_new[:, :2]
+            n = _norm_last_axis(v_new, keepdims=True)
+            over = n > v_max
+            any_over = over.any()
+            if any_over:
+                a_cap = (v_new * (v_max / np.maximum(n, 1e-12)) - v) / dt
+                np.copyto(uk[:, U_ACC], a_cap, where=over)
+
+            om, om_new = q[:, 2], q_new[:, 2]
+            hot = np.abs(om_new) > om_max
+            any_hot = hot.any()
+            if any_hot:
+                # Coincident +/-0 bounds have version-specific clip semantics.
+                bounded = (np.minimum(np.maximum(om_new, -om_max), om_max)
+                           if om_max > 0.0 else
+                           np.clip(om_new, -om_max, om_max))
+                al_cap = (bounded - om) / dt
+                np.copyto(uk[:, IAL], al_cap, where=hot)
+
+            if any_over or any_hot:
+                q_new = q + dt * uk
+            r_new = r + dt * q + half * uk
+            angle = r_new[:, 2]
+            r_new[:, 2] = np.arctan2(np.sin(angle), np.cos(angle))
+            nxt = X[:, k + 1, :]
+            nxt[:, :2] = r_new[:, :2]
+            nxt[:, S_VEL] = q_new[:, :2]
+            nxt[:, IPSI] = r_new[:, 2]
+            nxt[:, IOM] = q_new[:, 2]
+            r, q = r_new, q_new
+
+        U[:] = work_u.transpose(1, 0, 2)
+        return X
+
+    @staticmethod
+    def _rollout_singleton(X, U, dt, v_max, om_max):
+        """The same capped recurrence, without tiny array calls at every step.
+
+        Keep the order of each multiply/add and the original NumPy sqrt and
+        angle functions. Re-integrate the corrected acceleration, rather than
+        assigning the projected velocity directly: that round trip is part of
+        the existing floating-point result and the published X/U contract.
+        """
+        half = 0.5 * dt * dt
+        px, py, vx, vy, psi, om = X[0, 0].tolist()
+        for k in range(U.shape[1]):
+            ax, ay, al = U[0, k].tolist()
+            nx, ny = vx + dt * ax, vy + dt * ay
+            norm = float(np.sqrt(nx * nx + ny * ny))
+            if norm > v_max:
+                scale = v_max / max(norm, 1e-12)
+                ax, ay = (nx * scale - vx) / dt, (ny * scale - vy) / dt
+                U[0, k, U_ACC] = ax, ay
+
+            om_new = om + dt * al
+            if abs(om_new) > om_max:
+                # NumPy versions differ in np.clip's signed-zero behaviour
+                # when the bounds coincide. Delegate that special case.
+                bounded = (float(np.clip(om_new, -om_max, om_max))
+                           if om_max == 0.0 else
+                           (om_max if om_new > om_max else -om_max))
+                al = (bounded - om) / dt
+                U[0, k, IAL] = al
+
+            px, py = px + dt * vx + half * ax, py + dt * vy + half * ay
+            vx, vy = vx + dt * ax, vy + dt * ay
+            angle = psi + dt * om + half * al
+            psi = float(np.arctan2(np.sin(angle), np.cos(angle)))
+            om = om + dt * al
+            X[0, k + 1, :] = px, py, vx, vy, psi, om
         return X
 
 

@@ -42,6 +42,26 @@ G = 9.80665
 # anything physical.
 _TOL = 1e-6
 
+# The singleton loops use Python float arithmetic. Stay well away from overflow
+# (including the squared norms); unusual numerical inputs retain the NumPy path.
+_SCALAR_MAGNITUDE_LIMIT = 1e50
+
+
+def _scalar_range_ok(values):
+    """Finite, conservatively bounded values suitable for scalar arithmetic."""
+    return bool(np.all(np.abs(values) <= _SCALAR_MAGNITUDE_LIMIT))
+
+
+def _norm_last_axis(values, keepdims=False):
+    """NumPy's real-valued Euclidean norm without general linalg dispatch.
+
+    Callers already hold plain float64 arrays. This is the same multiply,
+    add.reduce and sqrt used by np.linalg.norm for one axis; its conjugate
+    and real-part operations are identities for these real inputs.
+    """
+    return np.sqrt(np.add.reduce(values * values, axis=-1,
+                                 keepdims=keepdims))
+
 
 class PlanarLimits(object):
     """Hard limits. Everything here is a constraint, not a cost term."""
@@ -175,12 +195,13 @@ class PlanarDynamics(object):
         U, was_2d = _as_batch(U)
         U = U.copy()
         K, N = U.shape[0], U.shape[1]
+        scalar_candidate = K == 1 and U.shape[2] == NNU and _scalar_range_ok(U)
 
         lim = self.lim
         U[..., IAL] = np.clip(U[..., IAL], -lim.alpha_max, lim.alpha_max)
 
         a = U[..., U_ACC]
-        n = np.linalg.norm(a, axis=-1, keepdims=True)
+        n = _norm_last_axis(a, keepdims=True)
         a *= np.minimum(1.0, lim.a_max_eff / np.maximum(n, 1e-12))
 
         if a_prev is None:
@@ -189,13 +210,33 @@ class PlanarDynamics(object):
             prev = np.broadcast_to(
                 np.asarray(a_prev, dtype=np.float64).reshape(-1)[:2],
                 (K, 2)).copy()
-            pn = np.linalg.norm(prev, axis=-1, keepdims=True)
+            pn = _norm_last_axis(prev, keepdims=True)
             prev *= np.minimum(1.0, lim.a_max_eff / np.maximum(pn, 1e-12))
 
         dmax = lim.j_max * self.dt
+        if (scalar_candidate
+                and 0.0 < self.dt <= _SCALAR_MAGNITUDE_LIMIT
+                and 0.0 <= dmax <= _SCALAR_MAGNITUDE_LIMIT
+                and _scalar_range_ok([lim.alpha_max, lim.a_max,
+                                      lim.tilt_max, lim.j_max])
+                and lim.alpha_max >= 0.0 and lim.a_max_eff >= 0.0
+                and _scalar_range_ok(U) and _scalar_range_ok(prev)):
+            # The alpha/disc projections above remain vectorised. Only the
+            # sequential jerk pass is expensive for K=1: each former array
+            # operation now performs the same two scalar float64 operations.
+            px, py = prev[0].tolist()
+            for k in range(N):
+                ax, ay = U[0, k, U_ACC].tolist()
+                dx, dy = ax - px, ay - py
+                dn = float(np.sqrt(dx * dx + dy * dy))
+                scale = min(1.0, dmax / max(dn, 1e-12))
+                px, py = px + dx * scale, py + dy * scale
+                U[0, k, U_ACC] = px, py
+            return U[0] if was_2d else U
+
         for k in range(N):
             d = U[:, k, U_ACC] - prev
-            dn = np.linalg.norm(d, axis=-1, keepdims=True)
+            dn = _norm_last_axis(d, keepdims=True)
             scale = np.minimum(1.0, dmax / np.maximum(dn, 1e-12))
             U[:, k, U_ACC] = prev + d * scale
             prev = U[:, k, U_ACC]
@@ -213,7 +254,7 @@ class PlanarDynamics(object):
         ok = np.isfinite(U).all(axis=(1, 2))
         ok &= (np.abs(U[..., IAL]) <= lim.alpha_max + _TOL).all(axis=1)
 
-        an = np.linalg.norm(U[..., U_ACC], axis=-1)
+        an = _norm_last_axis(U[..., U_ACC])
         ok &= (an <= lim.a_max_eff + _TOL).all(axis=1)
 
         if a_prev is None:
@@ -223,7 +264,7 @@ class PlanarDynamics(object):
                 np.asarray(a_prev, dtype=np.float64).reshape(-1)[:2],
                 (K, 2))[:, None, :]
         chain = np.concatenate([prev, U[..., U_ACC]], axis=1)      # (K, N+1, 2)
-        slew = np.linalg.norm(np.diff(chain, axis=1), axis=-1)     # (K, N)
+        slew = _norm_last_axis(np.diff(chain, axis=1))            # (K, N)
         ok &= (slew <= lim.j_max * self.dt + _TOL).all(axis=1)
 
         return ok[0] if was_2d else ok
@@ -283,7 +324,7 @@ class PlanarDynamics(object):
         lim = self.lim
 
         ok = np.isfinite(X).all(axis=(1, 2))
-        sp = np.linalg.norm(X[..., S_VEL], axis=-1)
+        sp = _norm_last_axis(X[..., S_VEL])
         ok &= (sp <= lim.v_max + _TOL).all(axis=1)
         ok &= (np.abs(X[..., IOM]) <= lim.omega_max + _TOL).all(axis=1)
 

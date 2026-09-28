@@ -55,20 +55,40 @@ from planner.types import IPSI, NNU, S_POS, S_VEL, U_ACC
 # Hoisted from inside `plan`, where it was a deferred import. It never guarded
 # a cycle -- geodesic.py imports numpy and scipy and nothing from this package
 # -- it was only ever there because the two files lived in different packages.
-from planner.haa.geodesic import CostToGo
+from planner.haa.geodesic import CostToGo, MapCostCache
 
 CLEAR, OCCUPIED, UNKNOWN = 0, 1, -1
 
 
+def _ray_cells(P, d, t, res, ox, oy, H, W):
+    """Return the cells from the original shared ray sampling coordinates."""
+    xs = P[:, 0:1] + t * d[:, 0:1]
+    ys = P[:, 1:2] + t * d[:, 1:2]
+    ix = np.floor((xs - ox) / res).astype(np.int64)
+    iy = np.floor((ys - oy) / res).astype(np.int64)
+    inb = (ix >= 0) & (ix < W) & (iy >= 0) & (iy < H)
+    return np.clip(ix, 0, W - 1), np.clip(iy, 0, H - 1), inb
+
+
+def _ray_cell_classes(classes, P, d, t, res, ox, oy):
+    """Gather one classification grid instead of two separate masks."""
+    H, W = classes.shape
+    ix, iy, inb = _ray_cells(P, d, t, res, ox, oy, H, W)
+    sampled = classes[iy, ix]
+    sampled[~inb] = OCCUPIED
+    return sampled
+
+
 def first_blocking_class(occ, P, goal, step=None, max_samples=256,
-                         r_pass=0.0):
+                         r_pass=0.0, cache=None):
     """What does the ray from each point to the goal hit first?
 
     P (K, 2) positions, goal (2,). Returns (K,) of CLEAR / OCCUPIED / UNKNOWN.
 
     The ray is parameterised t in [0, 1] from the point to the goal, exactly as
     in the paper, so its length is the distance to the goal and a point already
-    at the goal trivially has line of sight.
+    at the goal trivially has line of sight. An optional planner-owned cache
+    shares the exact occupied EDT with geodesic guidance and other ray calls.
     """
     P = np.asarray(P, dtype=np.float64).reshape(-1, 2)
     g = np.asarray(goal, dtype=np.float64).reshape(2)
@@ -87,7 +107,10 @@ def first_blocking_class(occ, P, goal, step=None, max_samples=256,
     # one place guidance was needed. With r_pass = r_safe the same ray is
     # blocked until the vehicle can actually fit through.
     if r_pass > 0.0:
-        passable = distance_transform_edt(~occupied) * float(occ.res) >= r_pass
+        if cache is None:
+            passable = distance_transform_edt(~occupied) * float(occ.res) >= r_pass
+        else:
+            passable = cache.passable(occupied, occ.res, r_pass)
         occupied = occupied | (~passable & ~unknown)
     res = float(occ.res)
     ox, oy = occ.origin
@@ -100,27 +123,41 @@ def first_blocking_class(occ, P, goal, step=None, max_samples=256,
     m = int(np.clip(m, 2, max_samples))
 
     t = np.linspace(0.0, 1.0, m)[None, :]                 # (1, m)
-    xs = P[:, 0:1] + t * d[:, 0:1]
-    ys = P[:, 1:2] + t * d[:, 1:2]
+    if P.shape[0] == 1:
+        # Acceptance evaluates one ray. Building a whole classification grid
+        # costs more than its two small gathers, especially on mixed maps.
+        ix, iy, inb = _ray_cells(P, d, t, res, ox, oy, H, W)
+        occ_hit = occupied[iy, ix] | ~inb
+        unk_hit = unknown[iy, ix]
+        first = int(np.argmax(occ_hit | unk_hit, axis=1)[0])
+        cls = OCCUPIED if occ_hit[0, first] else (
+            UNKNOWN if unk_hit[0, first] else CLEAR)
+        return np.asarray([cls], dtype=np.int64)
 
-    ix = np.floor((xs - ox) / res).astype(np.int64)
-    iy = np.floor((ys - oy) / res).astype(np.int64)
-    inb = (ix >= 0) & (ix < W) & (iy >= 0) & (iy < H)
-    jx = np.clip(ix, 0, W - 1)
-    jy = np.clip(iy, 0, H - 1)
+    # Resolve overlapping masks with the original occupied-first precedence.
+    # int8 keeps the sampled K x m array small; the public result stays int64.
+    classes = np.zeros((H, W), dtype=np.int8)
+    classes[unknown] = UNKNOWN
+    classes[occupied] = OCCUPIED
 
-    occ_hit = occupied[jy, jx] & inb
-    unk_hit = unknown[jy, jx] & inb
-    # Outside the grid is not free either; treat it as occupied so a ray that
-    # leaves the arena is not rewarded as if it were unexplored.
-    occ_hit |= ~inb
-    blocked = occ_hit | unk_hit
+    # The sampling density belongs to the WHOLE input batch. Compute m and t
+    # above before removing any rays, including rays already blocked at t=0.
+    if m > 0:
+        result = _ray_cell_classes(classes, P, d, t[:, :1], res, ox, oy)[:, 0]
+        clear = result == CLEAR
+        if not clear.any():
+            return result.astype(np.int64)
+        sample = _ray_cell_classes(classes, P[clear], d[clear], t, res, ox, oy)
+        first = np.argmax(sample != CLEAR, axis=1)
+        # An entirely clear row selects index zero, which is itself CLEAR;
+        # an additional any-block reduction and final np.where are unnecessary.
+        result[clear] = sample[np.arange(sample.shape[0]), first]
+        return result.astype(np.int64)
 
-    any_block = blocked.any(axis=1)
-    first = np.argmax(blocked, axis=1)                    # 0 when none blocked
-    rows = np.arange(P.shape[0])
-    cls = np.where(occ_hit[rows, first], OCCUPIED, UNKNOWN)
-    return np.where(any_block, cls, CLEAR)
+    # Retain the original error behavior for a zero-length sampling axis.
+    sample = _ray_cell_classes(classes, P, d, t, res, ox, oy)
+    first = np.argmax(sample != CLEAR, axis=1)
+    return sample[np.arange(P.shape[0]), first].astype(np.int64)
 
 
 class FrontierMPPI(PlanarMPPI):
@@ -140,6 +177,7 @@ class FrontierMPPI(PlanarMPPI):
         super(FrontierMPPI, self).__init__(*a, **kw)
         self.last_frontier = None          # class per sample, for diagnostics
         self.ctg = None                    # CostToGo for this solve
+        self._map_cost_cache = MapCostCache()
         # Below this speed there is no travel direction to align the camera
         # to, so the yaw term aims at the goal instead. `dyn.lim.v_max` is the
         # planner's own ceiling, so this tracks it rather than a constant.
@@ -153,7 +191,8 @@ class FrontierMPPI(PlanarMPPI):
         if not hasattr(occ, "unsafe"):        # FreeSpace: nothing to reason about
             return np.zeros(X.shape[0])
         cls = first_blocking_class(occ, X[:, -1, 0:2], goal,
-                                   r_pass=self.validator.r_safe)
+                                   r_pass=self.validator.r_safe,
+                                   cache=self._map_cost_cache)
         self.last_frontier = cls
         c = np.zeros(X.shape[0])
         c[cls == OCCUPIED] = self.c_occupied
@@ -186,24 +225,33 @@ class FrontierMPPI(PlanarMPPI):
           If it is ever revived, restore `_yaw_reference` from `mppi.py`
           (modes goal / velocity / hold) rather than reinventing it.
         """
-        w = self.w
         P = X[..., S_POS]
-        V = X[..., S_VEL]
-
         # Goal terms. Geodesic distance-to-go when the Dijkstra field is up
-        # (`plan` rebuilds it each solve); Euclidean otherwise. This replaces
+        # (`plan` refreshes it each solve); Euclidean otherwise. This replaces
         # the old swap-correction with the same value, stated directly.
         if self.use_geodesic and self.ctg is not None:
             d = self.ctg.query(P)
         else:
             d = np.linalg.norm(P - np.asarray(goal)[None, None, :], axis=-1)
+        cl = self.validator.clearance(P) if self.w.w_obs > 0.0 else None
+        return self._cost_from_parts(X, U, goal, a_prev, dict(d=d, clearance=cl, frontier=None))
+
+    def _cost_from_parts(self, X, U, goal, a_prev, parts):
+        """`_cost` given the per-node goal distance d (K,n), clearance (K,n)
+        and optionally the terminal frontier class (K,). Sums and their order
+        are exactly `_cost`'s; only where d / clearance / class were looked up
+        differs (NumPy in `_cost`, or planner/haa/cuda_batch.py)."""
+        w = self.w
+        P = X[..., S_POS]
+        V = X[..., S_VEL]
+        d = parts["d"]
         J = w.w_goal * d[:, :-1].sum(axis=1)
         J += w.w_term_pos * d[:, -1]
         J += w.w_term_vel * np.square(V[:, -1, :]).sum(axis=1)
 
         # Obstacle preference (the hard gate is the validator, not this).
         if w.w_obs > 0.0:
-            cl = self.validator.clearance(P)
+            cl = parts["clearance"]
             J += w.w_obs * np.square(
                 np.maximum(0.0, self.d_influence - cl)).sum(axis=1)
 
@@ -257,7 +305,20 @@ class FrontierMPPI(PlanarMPPI):
             e = np.arctan2(np.sin(psi - ref), np.cos(psi - ref))
             J += w.w_yaw * np.square(e).sum(axis=1)
 
-        return J + self.frontier_cost(X, goal)
+        if parts.get("frontier") is None:
+            return J + self.frontier_cost(X, goal)
+        return J + self._frontier_from_classes(parts["frontier"], X.shape[0])
+
+    def _frontier_from_classes(self, cls, K):
+        """frontier_cost's weighting of an already-computed class per sample."""
+        occ = self.validator.occ
+        if self.w_frontier == 0.0 or occ is None or not hasattr(occ, "unsafe"):
+            return np.zeros(K)
+        self.last_frontier = cls
+        c = np.zeros(K)
+        c[cls == OCCUPIED] = self.c_occupied
+        c[cls == UNKNOWN] = self.c_unknown
+        return self.w_frontier * c
 
     def _project_start(self, xi):
         """Poor-man's tube consistency (paper eq. 16) for the start state.
@@ -314,12 +375,14 @@ class FrontierMPPI(PlanarMPPI):
 
     def plan(self, state, goal, **kw):
         state = self._project_start(state)
-        # The map changes every tick, so the field is rebuilt every solve.
+        # Check current map contents every solve. A new field is necessary
+        # only when traversability, edge weights or the effective source change.
         if self.use_geodesic and getattr(self.validator, "occ", None) is not None:
             occ = self.validator.occ
             if hasattr(occ, "unsafe"):
                 self.ctg = CostToGo(occ, goal, self.validator.r_safe,
-                                    unknown_free=self.unknown_free)
+                                    unknown_free=self.unknown_free,
+                                    cache=self._map_cost_cache)
         return super(FrontierMPPI, self).plan(state, goal, **kw)
 
     def describe(self):

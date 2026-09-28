@@ -34,7 +34,7 @@ PROVENANCE = {
         "renderer.py":
             "66dd969508a141d4c7b07efc7f7f126ba74e4680590a572f0f3317a536d4beb7",
         "inverse_sensor.py":
-            "3bcae589b36d34b5fc1b4c3f1fe3e1e1c709db2bd443c4d5d16584fb9cf8ed71",
+            "412a04db95835873c1c05184e64012c6a160f179365ef0dd8fcc13f51ba0f0ba",
     },
 }
 

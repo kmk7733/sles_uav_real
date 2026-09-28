@@ -1,47 +1,22 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
-"""Online alignment between the Vicon world frame and the FCU's local ENU frame.
+"""Frame adapters for the shared, fixed EKF local -> world alignment.
 
-WHY THIS IS NEEDED
-Three frames are in play on this vehicle:
-
-  vicon/world   Vicon origin. /grid_map, /robot/pose_world and
-                /vicon/ROGX2/ROGX2 all live here. The planner works here,
-                because the obstacle grid does, and because HPA needs a global
-                frame.
-  ZED map       ZED's own origin (wherever it powered up). mavros_rogx.launch
-                feeds this into EKF2 as vision_pose.
-  FCU local ENU EKF2's own frame, initialised when the estimator started.
-                mavros/local_position/pose reports here, and -- critically --
-                mavros/setpoint_raw/local CONSUMES here.
-
-Because EKF2 is driven by the ZED (the mocap remap in mavros_rogx.launch is
-commented out), the FCU frame is anchored to wherever the ZED started, not to
-the Vicon origin. Measured example: Vicon put the vehicle at (-2.88, 0.32) while
-the ZED-anchored estimate was near the origin. Sending a vicon/world setpoint
-straight to mavros would therefore command a point about 2.9 m from where it was
-meant to be.
-
-WHAT THIS DOES
-Both /robot/pose_world and mavros/local_position/pose describe the SAME rigid
-body at the same instant, so the transform between the frames can be read off
-directly from a matched pair. Gravity is common to both, so it reduces to a
-4-DOF alignment -- translation plus a yaw rotation:
-
-    p_fcu = Rz(dyaw) p_world + t
-    yaw_fcu = yaw_world + dyaw
-
-The estimate is refreshed continuously and low-pass filtered, which also tracks
-EKF2 drifting against Vicon over a flight rather than baking in a one-shot
-calibration. That matters here because EKF2's position comes from ZED VIO.
-
-This is deliberately NOT a TF lookup. The TF tree carries 'map' for both the
-ZED map frame and (in mavros' own labelling) the FCU ENU frame; pose_to_world.py
-documents the same collision. Resolving it by name is ambiguous, so we measure
-instead.
+The EKF planner consumes SharedFrameAlignment, owned by ekf_world_align.py.
+WorldToFcu below remains for compatibility with legacy callers only. Its
+pair-based EMA estimator must not be used to re-estimate EKF-derived poses.
 """
 
 import numpy as np
+
+from ekf_alignment import SharedFrameAlignment
+
+
+def planar_ekf_velocity(alignment, linear_local, angular_z):
+    """MAVROS local ENU velocity -> map axes; preserve existing angular.z."""
+    velocity_world = alignment.rotate_to_world(
+        np.asarray(linear_local, dtype=np.float64))
+    return float(velocity_world[0]), float(velocity_world[1]), float(angular_z)
 
 
 def yaw_from_quat(x, y, z, w):

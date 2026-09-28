@@ -169,7 +169,7 @@ class PathGenerationNode:
 
             print("Reached waypoint")
             time.sleep(2)
-
+.
         print("Finished waypoints. Landing...")
         self.land()
 

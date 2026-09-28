@@ -1,0 +1,16 @@
+{"installed": 20, "root": "/home/rogx/catkin_ws/src", "processes_started": 0, "fcu_services_called": 0}
+{
+  "archive": "/home/rogx/backups/pre-collision-stop-20260922/src-before.tar.gz",
+  "unchanged_count": 610,
+  "changed": [
+    "offboard_flight/scripts/planar_producer_factory.py"
+  ],
+  "missing": [],
+  "unexpected_changes": [],
+  "allowed_changes": [
+    "hardware/hpa_integration/README.md",
+    "hardware/hpa_integration/TODOLIST.md",
+    "offboard_flight/scripts/planar_producer_factory.py"
+  ]
+}
+.git/index: OK

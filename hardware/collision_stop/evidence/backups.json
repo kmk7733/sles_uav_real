@@ -1,0 +1,21 @@
+{
+  "local": {
+    "backup_ref": "backup/pre-collision-stop-20260922",
+    "commit": "63ea8d5fb1cf60c8997634c9fef37b74241dbab2",
+    "source_archive": "/home/acrl/research/rogx_backups/pre-collision-stop-20260922/local_sources_before.tar.gz",
+    "sha256": "baf84b9c569a848466f4a487b917d3a7cb3866037abe3dfdf26a148beda61cb7",
+    "scope": "Current planner, offboard_flight, hardware, tests, docs sources. The previous complete 12.6 GB archive remains preserved; this is an incremental source backup.",
+    "index_sha256_before_and_after": "3c1e88d21e24624812f9d6b615edfe2f237808d462b0819f138883c8332656f8"
+  },
+  "rogx": {
+    "backup_ref": "backup/pre-collision-stop-20260922",
+    "commit": "9584d6eedbba62c807064edd01f84bb0e5c682a9",
+    "source_archive": "/home/rogx/backups/pre-collision-stop-20260922/src-before.tar.gz",
+    "source_sha256": "ef3e9bf2b9e9a9ecb6de87d78472b4bd37a1d93a6013a3996b0841d1c1228b58",
+    "vicon_archive": "/home/rogx/backups/pre-collision-stop-20260922/vicon-before.tar.gz",
+    "vicon_sha256": "966d9c4d02ff92c2c1200198ca190b38d8f16f2832831371aa38022eac28730e",
+    "local_copy_directory": "/home/acrl/research/rogx_backups/pre-collision-stop-20260922",
+    "scope": "Complete catkin_ws/src including ignored files and nested Git histories, plus complete vicon_traj. Alternate index Git source snapshot preserves working branch and original index."
+  },
+  "prior_complete_backups": "../../hpa_integration/evidence/backups.json"
+}

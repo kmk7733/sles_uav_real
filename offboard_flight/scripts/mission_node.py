@@ -48,6 +48,7 @@ from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger, TriggerResponse
 
 from guidance_library import Controller
+from ekf_alignment import SharedFrameAlignment
 
 ON_GROUND = ExtendedState.LANDED_STATE_ON_GROUND
 
@@ -63,7 +64,7 @@ class MissionNode(object):
     def __init__(self):
         rospy.init_node("mission_node")
         self.ctl = Controller()
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         P = rospy.get_param
 
         self.rate_hz = P("~pub_rate", 20.0)
@@ -89,6 +90,17 @@ class MissionNode(object):
         self.max_step = P("~max_step", 1.2)     # setpoint leash, metres
         self.fence_r = P("~fence_r", 6.0)       # from the arming point
         self.pose_timeout = P("~pose_timeout", 0.5)
+        # External producers keep their existing contract; fly.sh enables this
+        # guard for the EKF planner path.
+        self.require_frame_alignment = bool(P("~require_frame_alignment", False))
+        self.alignment_topic = P("~alignment_topic", "/robot/frame_alignment")
+        self.alignment_timeout = float(P("~alignment_timeout", 0.5))
+        self.alignment = SharedFrameAlignment(
+            expected_world=P("~world_frame", P("/robot/world_frame", "vicon/world")))
+        self.sp_epoch = self.active_epoch = None
+        self._alignment_stop_pending = False
+        self._alignment_fault_active = False
+        self._hold_pose_min_stamp = None
 
         self.pose = self.mav = self.sp = None
         self.landed = None
@@ -108,7 +120,10 @@ class MissionNode(object):
         rospy.Subscriber("mavros/extended_state", ExtendedState,
                          self._cb_landed, queue_size=1)
         rospy.Subscriber(self.sp_topic, PositionTarget,
-                         self._cb("sp", "t_sp"), queue_size=1)
+                         self._cb_sp, queue_size=1)
+        if self.require_frame_alignment:
+            rospy.Subscriber(self.alignment_topic, String,
+                             self._cb_alignment, queue_size=1)
         rospy.Subscriber(P("~arrived_topic", "/goal_arrive_tf"), Bool,
                          self._cb_arrived, queue_size=1)
 
@@ -134,6 +149,99 @@ class MissionNode(object):
                 if stamp:
                     setattr(self, stamp, rospy.get_time())
         return f
+
+    def _retire_aligned_commands_locked(self, new_fault=False, pose_after=None):
+        self.sp, self.sp_epoch = None, None
+        self.t_sp, self.t_arrived = 0.0, None
+        if (self.state in ("STREAM", "CLIMB", "MISSION") or
+                (new_fault and self.state == "HOLD")):
+            self.cmd = None
+            if self.state == "HOLD":
+                self.frozen = None
+            self._alignment_stop_pending = True
+            if pose_after is not None:
+                previous = getattr(self, "_hold_pose_min_stamp", None)
+                self._hold_pose_min_stamp = (pose_after if previous is None
+                                             else max(previous, pose_after))
+
+    def _cb_alignment(self, msg):
+        with self.lock:
+            was_ready = self.alignment.ready
+            changed = self.alignment.update_status(msg.data, now=rospy.get_time())
+            if changed or (was_ready and not self.alignment.ready):
+                # A distinct origin/fault also retires an already-frozen local
+                # target. Repeated invalid heartbeats must not chase the vehicle.
+                pose_after = (self.alignment.valid_from
+                              if changed and self.alignment.ready
+                              else self.alignment.stamp)
+                self._retire_aligned_commands_locked(new_fault=True,
+                                                      pose_after=pose_after)
+                self._alignment_fault_active = not self.alignment.ready
+
+    def _aligned_sp_usable_locked(self, sp, now):
+        if not self.require_frame_alignment:
+            return sp is not None
+        if (sp is None or not self.alignment.is_ready(
+                now=now, max_age=self.alignment_timeout) or
+                self.alignment.valid_from is None):
+            return False
+        stamp = sp.header.stamp.to_sec()
+        age = now - stamp
+        expected_frame = (self.alignment.local_frame + "/epoch/" +
+                          self.alignment.epoch)
+        return (sp.header.frame_id == expected_frame and np.isfinite(stamp) and
+                stamp >= self.alignment.valid_from and
+                -0.05 <= age <= self.sp_timeout)
+
+    def _cb_sp(self, msg):
+        with self.lock:
+            now = rospy.get_time()
+            if not self._aligned_sp_usable_locked(msg, now):
+                return
+            self.sp, self.t_sp = msg, now
+            self.sp_epoch = (self.alignment.epoch
+                             if self.require_frame_alignment else None)
+
+    def _fresh_local_pose_locked(self, now):
+        if self.pose is None:
+            return False
+        age = now - self.pose.header.stamp.to_sec()
+        p = self.pose.pose.position
+        return (np.all(np.isfinite([p.x, p.y, p.z, age, self.t_pose])) and
+                -0.05 <= age <= self.pose_timeout and
+                0.0 <= now - self.t_pose <= self.pose_timeout)
+
+    def _frame_guard_locked(self, now):
+        """Retire old commands and freeze once in fresh local EKF coordinates.
+
+        LAND/DISARM/PILOT semantics do not depend on the world alignment. A
+        transient loss in an active mission latches HOLD and never resumes it.
+        If the EKF pose is stale too, no old command is replayed while waiting
+        for the first fresh pose at which a hold can be established.
+        """
+        if not self.require_frame_alignment:
+            return True
+        ready = self.alignment.is_ready(now=now, max_age=self.alignment_timeout)
+        fresh_pose = self._fresh_local_pose_locked(now)
+        active = self.state in ("STREAM", "CLIMB", "MISSION")
+        wrong_epoch = active and self.active_epoch != self.alignment.epoch
+        fault = not ready or (active and (wrong_epoch or not fresh_pose))
+        new_fault = fault and not getattr(self, "_alignment_fault_active", False)
+        if fault:
+            self._retire_aligned_commands_locked(new_fault=new_fault)
+        self._alignment_fault_active = fault
+        if self._alignment_stop_pending and self.state in (
+                "STREAM", "CLIMB", "MISSION", "HOLD"):
+            min_stamp = getattr(self, "_hold_pose_min_stamp", None)
+            pose_is_current = (fresh_pose and
+                               (min_stamp is None or
+                                self.pose.header.stamp.to_sec() >= min_stamp))
+            if pose_is_current:
+                self._freeze(self.pose, "-- EKF frame/state unavailable or changed")
+                self._alignment_stop_pending = False
+                self._hold_pose_min_stamp = None
+            return False
+        return ready and fresh_pose
 
     def _cb_landed(self, msg):
         with self.lock:
@@ -172,9 +280,14 @@ class MissionNode(object):
         n = max(int(self.rate_hz / hz), 1)
         return int(self.elapsed * self.rate_hz) % n == 0
 
-    def _send(self, x, y, z, yaw):
-        self.cmd = self.ctl.construct_target(x, y, z, yaw)
-        self.pub.publish(self.cmd)
+    def _send(self, x, y, z, yaw, expected_state=None):
+        with self.lock:
+            if expected_state is not None:
+                if self.state != expected_state or not self._frame_guard_locked(rospy.get_time()):
+                    return False
+            self.cmd = self.ctl.construct_target(x, y, z, yaw)
+            self.pub.publish(self.cmd)
+            return True
 
     def _freeze(self, pose, why):
         """Stop where we are. Every failure that is not a landing ends here."""
@@ -205,6 +318,10 @@ class MissionNode(object):
         out.position.z = float(np.clip(p.z, self.z_want - 0.5,
                                        self.z_want + 0.5))
         out.header.stamp = rospy.Time.now()
+        if self.require_frame_alignment:
+            # Only commander/set_pose carries the epoch identifier. MAVROS
+            # receives ordinary local ENU with its normal PositionTarget frame.
+            out.header.frame_id = self.alignment.local_frame
         return out
 
     # ------------------------------------------------------------------- run
@@ -218,6 +335,8 @@ class MissionNode(object):
             with self.lock:
                 pose, mav, sp = self.pose, self.mav, self.sp
                 pose_age = rospy.get_time() - self.t_pose
+                if self.require_frame_alignment and pose is not None:
+                    pose_age = max(pose_age, rospy.get_time() - pose.header.stamp.to_sec())
                 sp_age = rospy.get_time() - self.t_sp
                 arrived_for = (rospy.get_time() - self.t_arrived
                                if self.t_arrived else 0.0)
@@ -234,12 +353,23 @@ class MissionNode(object):
                     self._enter("DONE", "-- disarmed")
                 elif mav.mode == "OFFBOARD":
                     self.offboard_once = True
-                elif self.offboard_once:
+                elif self.offboard_once and self.state != "DISARM":
+                    # ...except in DISARM, where WE are the ones that left
+                    # OFFBOARD: _disarm hands the vehicle to AUTO.LAND on
+                    # purpose. Without this the handoff reads as an RC
+                    # takeover and the node stops publishing under a log line
+                    # that blames the pilot.
                     self._enter("PILOT", "-- RC took over (mode=%s)" % mav.mode)
 
+            with self.lock:
+                frame_ready = self._frame_guard_locked(rospy.get_time())
             if self.state in ("DONE", "PILOT"):
                 rospy.loginfo_throttle(10.0, "[mission] %s -- not publishing",
                                        self.state)
+            elif (not frame_ready and
+                  (self.state in ("WAIT", "STREAM", "CLIMB", "MISSION") or
+                   self._alignment_stop_pending)):
+                rospy.logwarn_throttle(2.0, "[mission] waiting for valid EKF frame/state")
             elif pose is None or mav is None:
                 rospy.logwarn_throttle(2.0, "[mission] waiting for mavros")
             elif pose_age > self.pose_timeout and self.state != "WAIT":
@@ -266,23 +396,28 @@ class MissionNode(object):
     # ----------------------------------------------------------- the states
 
     def _wait(self, pose, mav, sp, sp_age, _arr):
-        if not mav.connected:
-            rospy.logwarn_throttle(2.0, "[mission] no FCU link")
-        elif not self.start_req:
-            rospy.loginfo_throttle(5.0, "[mission] READY -- rosservice call "
-                                        "%s/start", rospy.get_name())
-        elif sp_age > self.sp_timeout:
-            rospy.logwarn_throttle(2.0, "[mission] no planner on %s -- is it "
-                                        "running with _dry_run:=false?",
-                                   self.sp_topic)
-        else:
-            p = pose.pose.position
-            self.home = (p.x, p.y, p.z, yaw_of(pose))
-            rospy.loginfo("[mission] home (%.2f, %.2f, %.2f)", p.x, p.y, p.z)
-            self._enter("STREAM")
+        with self.lock:
+            if self.state != "WAIT" or not self._frame_guard_locked(rospy.get_time()):
+                return
+            if not mav.connected:
+                rospy.logwarn_throttle(2.0, "[mission] no FCU link")
+            elif not self.start_req:
+                rospy.loginfo_throttle(5.0, "[mission] READY -- rosservice call %s/start",
+                                       rospy.get_name())
+            elif (sp_age > self.sp_timeout or
+                  not self._aligned_sp_usable_locked(sp, rospy.get_time()) or
+                  (self.require_frame_alignment and self.sp_epoch != self.alignment.epoch)):
+                rospy.logwarn_throttle(2.0, "[mission] no current planner on %s", self.sp_topic)
+            else:
+                p = pose.pose.position
+                self.home = (p.x, p.y, p.z, yaw_of(pose))
+                self.active_epoch = self.alignment.epoch if self.require_frame_alignment else None
+                rospy.loginfo("[mission] home (%.2f, %.2f, %.2f)", p.x, p.y, p.z)
+                self._enter("STREAM")
 
     def _stream(self, pose, mav, sp, sp_age, _arr):
-        self._send(*self.home)
+        if not self._send(*self.home, expected_state="STREAM"):
+            return
         if self.elapsed < 1.0:
             return          # PX4 accepts OFFBOARD only once setpoints stream
         if mav.mode != "OFFBOARD":
@@ -293,6 +428,9 @@ class MissionNode(object):
             if self._every(1.0):
                 self._request(self.arming, (True,), "ARM")
         else:
+            with self.lock:
+                if self.state != "STREAM" or not self._frame_guard_locked(rospy.get_time()):
+                    return
             # The altitude target comes from the PLANNER, not from our own
             # takeoff_height. It publishes z0 in vicon/world through the
             # world->FCU alignment, and the Vicon floor is not the EKF2 origin
@@ -305,6 +443,10 @@ class MissionNode(object):
                         % self.z_want)
 
     def _request(self, srv, args, what):
+        if what in ("ARM", "OFFBOARD"):
+            with self.lock:
+                if self.state != "STREAM" or not self._frame_guard_locked(rospy.get_time()):
+                    return
         rospy.loginfo_throttle(2.0, "[mission] requesting %s", what)
         try:
             if isinstance(args, dict):
@@ -317,8 +459,10 @@ class MissionNode(object):
     def _climb(self, pose, mav, sp, sp_age, _arr):
         dt = abs(self.z_want - self.z0) / max(self.v_climb, 1e-3)
         f = 1.0 if dt < 1e-3 else min(self.elapsed / dt, 1.0)
-        self._send(self.home[0], self.home[1],
-                   self.z0 + f * (self.z_want - self.z0), self.home[3])
+        if not self._send(self.home[0], self.home[1],
+                          self.z0 + f * (self.z_want - self.z0), self.home[3],
+                          expected_state="CLIMB"):
+            return
 
         if f < 1.0 or abs(pose.pose.position.z - self.z_want) > self.z_tol:
             self.t_level = None
@@ -330,25 +474,39 @@ class MissionNode(object):
             rospy.logwarn_throttle(2.0, "[mission] hovering, no planner")
             return
         with self.lock:
+            if self.state != "CLIMB" or not self._frame_guard_locked(rospy.get_time()):
+                return
             self.t_arrived = None       # ignore a latch from before takeoff
-        self._enter("MISSION", "-- settled at %.2f m" % self.z_want)
+            self._enter("MISSION", "-- settled at %.2f m" % self.z_want)
 
     def _mission(self, pose, mav, sp, sp_age, arrived_for):
-        if sp_age > self.sp_timeout:
-            return self._freeze(pose, "-- planner silent %.2f s" % sp_age)
-        out = self._forward(sp, pose)
-        if out is None:
-            return self._freeze(pose, "-- unusable setpoint")
-        self.cmd = out
-        self.pub.publish(out)
-
-        if arrived_for >= self.arrive_hold:
-            if self.land_on_arrive:
-                self._begin_land(pose, "-- GOAL REACHED")
-            else:
-                self._freeze(pose, "-- GOAL REACHED (~land_on_arrive false)")
-        elif self.elapsed > self.mission_timeout:
-            self._freeze(pose, "-- mission_timeout")
+        # The callback that invalidates alignment takes this same lock. It
+        # cannot retire an epoch between the final check and publication.
+        with self.lock:
+            now = rospy.get_time()
+            if self.state != "MISSION" or not self._frame_guard_locked(now):
+                return
+            if self.require_frame_alignment:
+                # Use the latest command under this lock. A newer valid message
+                # arriving after run() took its snapshot is normal, not a fault.
+                sp, sp_age = self.sp, now - self.t_sp
+            if (sp_age > self.sp_timeout or
+                    not self._aligned_sp_usable_locked(sp, now) or
+                    (self.require_frame_alignment and
+                     self.sp_epoch != self.alignment.epoch)):
+                return self._freeze(pose, "-- planner silent or stale-epoch setpoint")
+            out = self._forward(sp, pose)
+            if out is None:
+                return self._freeze(pose, "-- unusable setpoint")
+            self.cmd = out
+            self.pub.publish(out)
+            if arrived_for >= self.arrive_hold:
+                if self.land_on_arrive:
+                    self._begin_land(pose, "-- GOAL REACHED")
+                else:
+                    self._freeze(pose, "-- GOAL REACHED (~land_on_arrive false)")
+            elif self.elapsed > self.mission_timeout:
+                self._freeze(pose, "-- mission_timeout")
 
     def _begin_land(self, pose, why):
         self.land_req = False
@@ -367,7 +525,11 @@ class MissionNode(object):
         if landed is None:
             rospy.logwarn_throttle(2.0, "[mission] no extended_state -- "
                                         "touchdown from height and clock")
-        down = (landed == ON_GROUND) if landed is not None else (
+        # `or`, not `if landed is not None else`. The height test was a
+        # fallback for a MISSING extended_state; the topic is present and
+        # WRONG -- IN_AIR through the whole descent, flipping only at the kill
+        # switch -- so the fallback never ran though its condition held.
+        down = (landed == ON_GROUND) or (
             pose.pose.position.z - self.home[2] < 0.12
             and self.elapsed > self.t_touch)
         if down:
@@ -382,14 +544,31 @@ class MissionNode(object):
         # hands the aircraft to a failsafe instead.
         self._send(self.frozen[0], self.frozen[1],
                    self.home[2] - self.land_push, self.frozen[3])
+        # PX4 REFUSES A DISARM WHILE ITS LAND DETECTOR SAYS IN_AIR, and on
+        # this airframe it says IN_AIR even at rest: measured 2026-09-09,
+        # seven disarm requests over 13.5 s, all rejected. Sitting ~5 mm up in
+        # ground effect the thrust never falls far enough for the detector, and
+        # no position setpoint fixes that -- the floor is already 0.25 m below
+        # the ground. So stop asking, and let PX4 finish its own way: AUTO.LAND
+        # ramps the thrust down, its detector then fires, and COM_DISARM_LAND
+        # (2 s) disarms. By here the vehicle is already on the ground.
         if self._every(2.0):
-            self._request(self.arming, (False,), "DISARM")
+            if mav is not None and mav.mode != "AUTO.LAND":
+                self._request(self.set_mode, dict(custom_mode="AUTO.LAND"),
+                              "AUTO.LAND")
+            else:
+                self._request(self.arming, (False,), "DISARM")
         if self.elapsed > 8.0:
             rospy.logerr_throttle(2.0, "[mission] still armed -- disarm on "
                                        "the RC")
 
     def _hold(self, pose, mav, sp, sp_age, _arr):
-        self._send(*self.frozen)
+        with self.lock:
+            if self.require_frame_alignment and self._alignment_stop_pending:
+                self._frame_guard_locked(rospy.get_time())
+            if self._alignment_stop_pending or self.frozen is None:
+                return
+            self._send(*self.frozen)
         rospy.loginfo_throttle(5.0, "[mission] HOLD at (%.2f, %.2f) -- "
                                     "%s/land", self.frozen[0], self.frozen[1],
                                rospy.get_name())
