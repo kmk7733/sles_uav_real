@@ -6,9 +6,11 @@
 //   -> inputs_ok & states_ok & validator.nodes_safe
 // plus the per-node lookups FrontierMPPI._cost needs (geodesic or Euclidean
 // goal distance, clearance) and first_blocking_class's terminal ray. The cost
-// SUMS stay in NumPy (same reduction order). Build with -fmad=false so no
-// multiply-add is contracted; sqrt and division are IEEE (no fast-math).
-// sin/cos/atan2 (heading wrap only) may differ from libm by an ulp.
+// SUMS stay in NumPy (same reduction order), except the yaw term of the goal /
+// goal_in_view modes when yaw_mode != 0: its per-sample sum over nodes is
+// formed here (sequential order, the same expressions). Build with -fmad=false
+// so no multiply-add is contracted; sqrt and division are IEEE (no fast-math).
+// sin/cos/atan2 (heading wrap, yaw term) may differ from libm by an ulp.
 #include <cuda_runtime.h>
 #include <math.h>
 #include <stdint.h>
@@ -22,11 +24,14 @@ typedef struct {
     double alpha_lim, a_lim, j_lim, v_lim, om_lim;
     double res, ox, oy, r_safe, gx, gy, penalty;
     double xi0[6], prev_clip[2], prev_raw[2];
+    // yaw_mode 0: no yaw term here; 1: 'goal'; 2: 'goal_in_view' (half-angle yaw_half)
+    double yaw_half, ygx, ygy;
+    int yaw_mode, pad2;
 } MppiParams;
 
 }
 
-static double *d_uin = 0, *d_uout = 0, *d_x = 0, *d_dgeo = 0, *d_cl = 0, *d_clear = 0, *d_field = 0, *d_t = 0;
+static double *d_uin = 0, *d_uout = 0, *d_x = 0, *d_dgeo = 0, *d_cl = 0, *d_clear = 0, *d_field = 0, *d_t = 0, *d_yaw = 0;
 static unsigned char *d_flags = 0;
 static signed char *d_classes = 0;
 static int *d_cls = 0;
@@ -48,7 +53,7 @@ __device__ static inline long long cell(double v, double o, double res) {
 
 __global__ void eval_kernel(MppiParams p, const double *uin, double *uout, double *X,
                             unsigned char *flags, double *dgeo, double *cl,
-                            const double *clear_tab, const double *field) {
+                            const double *clear_tab, const double *field, double *yaw) {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= p.K) return;
     const int N = p.N;
@@ -117,8 +122,20 @@ __global__ void eval_kernel(MppiParams p, const double *uin, double *uout, doubl
 
     // --- states_ok, nodes_safe, per-node lookups ---------------------------
     int st_ok = 1, safe = 1;
+    double ysum = 0.0;
     for (int j = 0; j <= N; ++j) {
         const double *xn = x + (size_t)j * 6;
+        if (p.yaw_mode) {
+            // FrontierMPPI._cost_from_parts yaw block, goal / goal_in_view modes.
+            double ref = atan2(p.ygy - xn[1], p.ygx - xn[0]);
+            double d = xn[4] - ref;
+            double e = atan2(sin(d), cos(d));
+            if (p.yaw_mode == 2) {
+                double a = fabs(e) - p.yaw_half;
+                e = a < 0.0 ? 0.0 : a;
+            }
+            ysum += e * e;
+        }
         for (int i = 0; i < 6; ++i) if (!isfinite(xn[i])) st_ok = 0;
         if (!(sqrt(xn[2] * xn[2] + xn[3] * xn[3]) <= p.v_lim)) st_ok = 0;
         if (!(fabs(xn[5]) <= p.om_lim)) st_ok = 0;
@@ -139,6 +156,7 @@ __global__ void eval_kernel(MppiParams p, const double *uin, double *uout, doubl
         dgeo[(size_t)k * (N + 1) + j] = dg;
     }
     flags[k] = (unsigned char)(in_ok | (st_ok << 1) | (safe << 2));
+    yaw[k] = ysum;
 }
 
 __device__ static inline int ray_class(const signed char *classes, int H, int W, double res,
@@ -170,7 +188,7 @@ __global__ void frontier_kernel(int K, int N, double gx, double gy, int m, const
 extern "C" {
 
 int mppi_eval(const MppiParams *p, const double *uin, const double *clear_tab, const double *field,
-              double *uout, double *X, unsigned char *flags, double *dgeo, double *cl) {
+              double *uout, double *X, unsigned char *flags, double *dgeo, double *cl, double *yaw) {
     size_t nu = (size_t)p->K * p->N * 3 * sizeof(double);
     size_t nx = (size_t)p->K * (p->N + 1) * 6 * sizeof(double);
     size_t nn = (size_t)p->K * (p->N + 1) * sizeof(double);
@@ -187,8 +205,10 @@ int mppi_eval(const MppiParams *p, const double *uin, const double *clear_tab, c
     if ((size_t)p->K > cap_k) {
         if (d_flags) cudaFree(d_flags);
         if (d_cls) cudaFree(d_cls);
-        d_flags = 0; d_cls = 0; cap_k = 0;
-        if (cudaMalloc((void **)&d_flags, p->K) != cudaSuccess || cudaMalloc((void **)&d_cls, p->K * sizeof(int)) != cudaSuccess) return -1;
+        if (d_yaw) cudaFree(d_yaw);
+        d_flags = 0; d_cls = 0; d_yaw = 0; cap_k = 0;
+        if (cudaMalloc((void **)&d_flags, p->K) != cudaSuccess || cudaMalloc((void **)&d_cls, p->K * sizeof(int)) != cudaSuccess
+            || cudaMalloc((void **)&d_yaw, p->K * sizeof(double)) != cudaSuccess) return -1;
         cap_k = p->K;
     }
     if (nm > cap_map) {
@@ -204,13 +224,14 @@ int mppi_eval(const MppiParams *p, const double *uin, const double *clear_tab, c
     if (cudaMemcpy(d_clear, clear_tab, nm, cudaMemcpyHostToDevice) != cudaSuccess) return -2;
     if (p->use_geo && cudaMemcpy(d_field, field, nm, cudaMemcpyHostToDevice) != cudaSuccess) return -2;
     int threads = 32, blocks = (p->K + threads - 1) / threads;   // 6 blocks at K=192: every SM
-    eval_kernel<<<blocks, threads>>>(*p, d_uin, d_uout, d_x, d_flags, d_dgeo, d_cl, d_clear, d_field);
+    eval_kernel<<<blocks, threads>>>(*p, d_uin, d_uout, d_x, d_flags, d_dgeo, d_cl, d_clear, d_field, d_yaw);
     if (cudaGetLastError() != cudaSuccess) return -3;
     if (cudaMemcpy(uout, d_uout, nu, cudaMemcpyDeviceToHost) != cudaSuccess) return -4;
     if (cudaMemcpy(X, d_x, nx, cudaMemcpyDeviceToHost) != cudaSuccess) return -4;
     if (cudaMemcpy(flags, d_flags, p->K, cudaMemcpyDeviceToHost) != cudaSuccess) return -4;
     if (cudaMemcpy(dgeo, d_dgeo, nn, cudaMemcpyDeviceToHost) != cudaSuccess) return -4;
     if (cudaMemcpy(cl, d_cl, nn, cudaMemcpyDeviceToHost) != cudaSuccess) return -4;
+    if (cudaMemcpy(yaw, d_yaw, p->K * sizeof(double), cudaMemcpyDeviceToHost) != cudaSuccess) return -4;
     last_K = p->K; last_N = p->N;
     return 0;
 }

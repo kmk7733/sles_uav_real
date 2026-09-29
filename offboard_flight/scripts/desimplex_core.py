@@ -55,6 +55,42 @@ def _warm_imports(haa_backend):
         enable_cuda()     # library load + CUDA context now, not in the first tick
 
 
+def _warm_planner(producer_config, haa_backend, recovery_only=False):
+    """One throwaway supervisor solve at process start, so the first real tick is not the first solve.
+
+    A separate assembly on a synthetic grid (one obstacle, an unknown band),
+    discarded afterwards: the real assembly is still built on the first tick
+    from its own seeds, and nothing here uses a global RNG, so no decision
+    changes. On ROGX the first real tick cost ~220 ms against ~95 ms steady.
+    Returns the wall time in ms.
+    """
+    from planar_producer_factory import build_producer
+    from planner.hpa import BodyActionChunk
+    t0 = time.perf_counter()
+    r_safe = float(producer_config["safety"]["r_safe"])
+    H = W = 160
+    data = np.zeros(H * W, dtype=np.int8)
+    data.reshape(H, W)[:, 120:] = -1
+    data.reshape(H, W)[70:90, 60:66] = 100
+    occ = _parse_grid(dict(frame_id="warmup", width=W, height=H, resolution=0.05, origin=[-4.0, -4.0], data=data),
+                      r_safe)
+    xi, goal = np.array([-2.0, 0.0, 0.0, 0.0, 0.0, 0.0]), np.array([1.0, 0.0])
+    occ.clear_disc(xi[0], xi[1], r_safe + FOOTPRINT_EXTRA)
+    chunk = BodyActionChunk(np.zeros((10, 3)), 0.0)
+    assembly = build_producer("desimplex", producer_config, occupancy=occ, goal=goal,
+                              action_provider=lambda state, g: chunk)
+    if haa_backend == "cuda":
+        from planner.haa.cuda_batch import enable_cuda
+        enable_cuda(assembly.haa, assembly.probe)
+    sup = assembly.producer
+    sup.set_occupancy(occ)
+    if recovery_only:
+        sup.recovery(xi, a_prev=np.zeros(2))
+    else:
+        sup.plan(xi, goal=goal, a_prev=np.zeros(2))
+    return 1000 * (time.perf_counter() - t0)
+
+
 def _look_end(sup, hpa_ref):
     """The (state, a_prev) DeSimplexSupervisor._committed_ok probes, or None."""
     from planner.types import NXI, S_POS, S_VEL
@@ -206,6 +242,7 @@ class ProbeHelper(object):
         self.occ = None
         self.assembly = None
         _warm_imports(haa_backend)
+        self.warmup_ms = _warm_planner(producer_config, haa_backend, recovery_only=True)
 
     def tick(self, req):
         from planar_producer_factory import build_producer
@@ -238,21 +275,46 @@ class SupervisorCore(object):
         self.grid = None           # dict(seq, epoch, occ, meta)
         self.holder = {"chunk": None}
         self.ticks = 0
+        self.pending_snapshot = None      # grid meta whose snapshot after_reply() writes
+        self.snapshots = set()            # grid seqs already written or scheduled
+        self.deferred_save_ms = None
+        self.deferred_error = None
         _warm_imports(haa_backend)
         self.look = ParallelLookProbe(producer_config, haa_backend) if parallel_probe else None
         self.cache = TickProbeCache() if probe_cache else None
+        self.warmup_ms = dict(worker=_warm_planner(producer_config, haa_backend),
+                              helper=None if self.look is None else self.look.channel.ready.get("warmup_ms"))
 
     def _save(self, g):
+        """Name of this grid's snapshot. The write waits for after_reply(), off the tick's critical path."""
         if self.snapshot_dir is None:
             return None, 0.0
+        if g["seq"] not in self.snapshots:
+            self.snapshots.add(g["seq"])
+            self.pending_snapshot = g
+        return "grid_%06d.npz" % g["seq"], 0.0
+
+    def after_reply(self):
+        """Write the snapshot the tick just answered scheduled (8 ms mean on ROGX, every tick has a new grid).
+
+        Runs while the node handles the reply. A failed write fails the NEXT tick,
+        as an in-tick failure used to fail this one.
+        """
+        g, self.pending_snapshot = self.pending_snapshot, None
+        if g is None:
+            self.deferred_save_ms = None
+            return
         t0 = time.perf_counter()
-        path = self.snapshot_dir / ("grid_%06d.npz" % g["seq"])
-        if not path.exists():
-            self.snapshot_dir.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(path, frame_id=g["frame_id"], data=np.asarray(g["data"], dtype=np.int8),
-                                width=g["width"], height=g["height"], resolution=g["resolution"],
-                                origin=np.asarray(g["origin"]), stamp=g["stamp"], epoch=g["epoch"])
-        return path.name, 1000 * (time.perf_counter() - t0)
+        try:
+            path = self.snapshot_dir / ("grid_%06d.npz" % g["seq"])
+            if not path.exists():
+                self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(path, frame_id=g["frame_id"], data=np.asarray(g["data"], dtype=np.int8),
+                                    width=g["width"], height=g["height"], resolution=g["resolution"],
+                                    origin=np.asarray(g["origin"]), stamp=g["stamp"], epoch=g["epoch"])
+        except Exception as error:
+            self.deferred_error = "grid snapshot %s failed: %r" % (g["seq"], error)
+        self.deferred_save_ms = 1000 * (time.perf_counter() - t0)
 
     def needs_observation(self):
         """True when the next tick's supervisor call will ask the HPA for a new chunk."""
@@ -277,7 +339,9 @@ class SupervisorCore(object):
     def tick(self, req):
         from planar_producer_factory import build_producer
         from planner.hpa import BodyActionChunk
-        reply = dict(constructed=None, backend=None)
+        if self.deferred_error is not None:
+            raise RuntimeError(self.deferred_error)
+        reply = dict(constructed=None, backend=None, grid_save_deferred_ms=self.deferred_save_ms)
         g = req.get("grid")
         if g is not None and (self.grid is None or g["seq"] != self.grid["seq"]):
             self.grid = dict(seq=g["seq"], epoch=g["epoch"], occ=_parse_grid(g, self.r_safe), meta=g)
@@ -341,7 +405,7 @@ def _serve(conn, make):
     init = conn.recv()
     try:
         obj = make(**init)
-        conn.send(dict(ok=True, ready=True, pid=os.getpid()))
+        conn.send(dict(ok=True, ready=True, pid=os.getpid(), warmup_ms=getattr(obj, "warmup_ms", None)))
     except Exception as error:
         conn.send(dict(ok=False, error=repr(error), trace=traceback.format_exc()))
         return
@@ -356,6 +420,10 @@ def _serve(conn, make):
             conn.send(dict(ok=True, reply=obj.tick(req)))
         except Exception as error:  # the supervisor may be half-updated: the node stops
             conn.send(dict(ok=False, error=repr(error), trace=traceback.format_exc()))
+            continue
+        after = getattr(obj, "after_reply", None)
+        if after is not None:
+            after()
 
 
 class _Channel(object):
@@ -374,7 +442,8 @@ class _Channel(object):
         child.close()
         self.conn = Connection(parent.detach())
         self.conn.send(init)
-        self.pid = self.recv(start_timeout, "start")["pid"]
+        self.ready = self.recv(start_timeout, "start")
+        self.pid = self.ready["pid"]
 
     def recv(self, timeout, what):
         if not self.conn.poll(timeout):
@@ -409,6 +478,7 @@ class SupervisorWorker(object):
                                              snapshot_dir=None if snapshot_dir is None else str(snapshot_dir),
                                              parallel_probe=parallel_probe, probe_cache=probe_cache))
         self.pid = self.channel.pid
+        self.warmup_ms = self.channel.ready.get("warmup_ms")
         self.reply_timeout = reply_timeout
         self.next_needs_observation = True
         self.ticks_until_refresh = 1

@@ -100,7 +100,7 @@ class DeSimplexPlannerNode(HPAPlannerNode):
                                            probe_cache=getattr(args, "probe_cache", False))
             self.emit("desimplex_worker", pid=self.worker.pid, haa_backend=getattr(args, "haa_backend", "numpy"),
                       parallel_probe=getattr(args, "parallel_probe", False),
-                      probe_cache=getattr(args, "probe_cache", False))
+                      probe_cache=getattr(args, "probe_cache", False), warmup_ms=self.worker.warmup_ms)
 
     # --------------------------------------------------------- construction
 
@@ -354,6 +354,7 @@ class DeSimplexPlannerNode(HPAPlannerNode):
                       goal_world=self.goal_world.tolist())
         log = dict(tick=self.ticks, grid_seq=grid["seq"], hpa_commit_index=r["hpa_commit_index"],
                    grid_file=r["grid_file"], supervisor_ms=r["supervisor_ms"], grid_save_ms=r["grid_save_ms"],
+                   grid_save_deferred_ms=r.get("grid_save_deferred_ms"),
                    worker_roundtrip_ms=worker_ms, look_probe=r["look_probe"], probe_cache=r["probe_cache"],
                    xi_world=xi_w.tolist(), goal_world=self.goal_world.tolist(), a_prev_world=a_prev_w.tolist(),
                    alignment=dict(epoch=grid["epoch"], yaw=yaw_offset, translation=translation.tolist()),

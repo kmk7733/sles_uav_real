@@ -295,7 +295,11 @@ class FrontierMPPI(PlanarMPPI):
         # `v_stopped` there is no travel direction to align to, so the
         # reference falls back to the GOAL bearing -- the vehicle turns to look
         # at where it wants to be, which is what breaks the deadlock.
-        if getattr(w, 'w_yaw', 0.0) > 0.0:
+        if getattr(w, 'w_yaw', 0.0) > 0.0 and parts.get("yaw") is not None:
+            # The same per-sample sum, formed on the GPU (planner/haa/cuda_batch.py,
+            # goal / goal_in_view modes only).
+            J += w.w_yaw * parts["yaw"]
+        elif getattr(w, 'w_yaw', 0.0) > 0.0:
             psi = X[..., IPSI]
             mode = getattr(w, 'yaw_mode', 'velocity')
             if mode in ('goal', 'goal_in_view'):

@@ -7,11 +7,12 @@ order, weighting, the damped update, swept validation and all fallbacks --
 stays in the original NumPy code. Positions, velocities, inputs, validity,
 distances and clearances are computed with the same double-precision operation
 order (nvcc -fmad=false); only the heading wrap (sin/cos/atan2) may differ from
-libm by an ulp. The yaw term (w_yaw > 0) needs no kernel support: it is a
-function of the rolled-out X (heading, position, velocity) and is summed in
-FrontierMPPI._cost_from_parts like every other term. Anything the kernel does
-not reproduce exactly (other dynamics, no occupancy grid) falls back to the
-NumPy path for that call.
+libm by an ulp. The yaw term (w_yaw > 0) of the goal / goal_in_view modes is
+summed per sample in the kernel with the same expressions (sequential node
+order instead of NumPy's pairwise sum) and handed back as parts["yaw"]; the
+velocity mode's yaw term is still formed in NumPy from X. Anything the kernel
+does not reproduce exactly (other dynamics, no occupancy grid) falls back to
+the NumPy path for that call.
 
 Opt-in only: the simulator and existing nodes never enable it.
 """
@@ -23,6 +24,7 @@ import numpy as np
 
 from planner.dynamics import PlanarDynamics, _norm_last_axis, _TOL
 from planner.haa.capped import CappedDynamics
+from planner.haa.cost import GOAL_VIEW_HALF_ANGLE
 from planner.haa.geodesic import REACH_PENALTY_M
 from planner.types import S_POS
 
@@ -36,7 +38,9 @@ class _Params(ctypes.Structure):
                                                 "dmax", "alpha_lim", "a_lim", "j_lim", "v_lim", "om_lim",
                                                 "res", "ox", "oy", "r_safe", "gx", "gy", "penalty")] +
                 [("xi0", ctypes.c_double * 6), ("prev_clip", ctypes.c_double * 2),
-                 ("prev_raw", ctypes.c_double * 2)])
+                 ("prev_raw", ctypes.c_double * 2)] +
+                [(n, ctypes.c_double) for n in ("yaw_half", "ygx", "ygy")] +
+                [(n, ctypes.c_int) for n in ("yaw_mode", "pad2")])
 
 
 def _ptr(a):
@@ -147,6 +151,12 @@ class CudaBatch(object):
             p.xi0[i] = xi[i]
         p.prev_clip[0], p.prev_clip[1] = prev_clip[0]
         p.prev_raw[0], p.prev_raw[1] = prev_raw
+        yaw_mode = getattr(planner.w, "yaw_mode", "velocity")
+        gpu_yaw = getattr(planner.w, "w_yaw", 0.0) > 0.0 and yaw_mode in ("goal", "goal_in_view")
+        p.yaw_mode = (2 if yaw_mode == "goal_in_view" else 1) if gpu_yaw else 0
+        p.yaw_half = float(GOAL_VIEW_HALF_ANGLE) if yaw_mode == "goal_in_view" else 0.0
+        gy = np.asarray(goal, dtype=np.float64).reshape(-1)[:2]   # _cost_from_parts' goal
+        p.ygx, p.ygy = float(gy[0]), float(gy[1])
         if ctg is not None and (ctg.H, ctg.W, ctg.res, ctg.origin) != (occ.H, occ.W, p.res, (p.ox, p.oy)):
             self.fallbacks += 1
             return self._cpu(planner, xi0, U, a_prev)
@@ -157,8 +167,9 @@ class CudaBatch(object):
         flags = np.empty(K, dtype=np.uint8)
         dgeo = np.empty((K, N + 1))
         cl = np.empty((K, N + 1))
+        yaw = np.empty(K)
         rc = self.lib.mppi_eval(ctypes.byref(p), _ptr(U), _ptr(clear), _ptr(field),
-                                _ptr(Uo), _ptr(X), _ptr(flags), _ptr(dgeo), _ptr(cl))
+                                _ptr(Uo), _ptr(X), _ptr(flags), _ptr(dgeo), _ptr(cl), _ptr(yaw))
         if rc != 0:
             raise RuntimeError("mppi_eval failed: %d" % rc)
         valid = flags == 7
@@ -181,7 +192,8 @@ class CudaBatch(object):
                 raise RuntimeError("mppi_frontier failed: %d" % rc)
             frontier = out.astype(np.int64)
         U[...] = Uo    # rollout's in-place contract: the caller's U holds the applied inputs
-        parts = dict(d=dgeo, clearance=cl if planner.w.w_obs > 0.0 else None, frontier=frontier)
+        parts = dict(d=dgeo, clearance=cl if planner.w.w_obs > 0.0 else None, frontier=frontier,
+                     yaw=yaw if gpu_yaw else None)
         return U, X, valid, parts
 
 
