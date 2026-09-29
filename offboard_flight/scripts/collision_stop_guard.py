@@ -31,7 +31,7 @@ def check_resolved_topics(ros, config):
     resolved = {key: ros.resolve_name(value) for key, value in config["topics"].items()}
     if len(set(resolved.values())) != len(resolved):
         raise ValueError("resolved nominal/safe/status/execution topics must be distinct")
-    sensor_topics = [config["vehicle"]["topic"]] + list(config["obstacle_topics"].values())
+    sensor_topics = [config["vehicle"]["topic"]]    # obstacles: static map, no Vicon topic
     sensor_names = [ros.resolve_name(topic) for topic in sensor_topics]
     if len(set(sensor_names)) != len(sensor_names) or set(sensor_names) & set(resolved.values()):
         raise ValueError("resolved Vicon subjects must be distinct from each other and gate topics")
@@ -101,10 +101,9 @@ class CollisionStopGuard(object):
             self.safe_pub = ros.Publisher(self.topics["safe"], message_types["PositionTarget"], queue_size=1)
         ros.Subscriber(self.topics["nominal"], message_types["PositionTarget"], self._nominal_cb, queue_size=1)
         ros.Subscriber(self.topics["execution"], message_types["String"], self._execution_cb, queue_size=1)
-        subjects = [("vehicle", self.profile["vehicle"]["topic"])] + sorted(self.profile["obstacle_topics"].items())
-        for name, topic in subjects:
-            ros.Subscriber(topic, message_types["TransformStamped"], self._vicon_cb,
-                           callback_args=name, queue_size=10)
+        # Only the vehicle is tracked live; obstacles are the static map.yaml footprints.
+        ros.Subscriber(self.profile["vehicle"]["topic"], message_types["TransformStamped"], self._vicon_cb,
+                       callback_args="vehicle", queue_size=10)
 
     def _nominal_cb(self, msg):
         with self.lock:

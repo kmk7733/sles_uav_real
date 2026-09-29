@@ -6,11 +6,14 @@
   "vicon_frame_id": "REPLACE_WITH_OBSERVED_VICON_HEADER_FRAME",
   "vehicle": {
     "topic": "REPLACE_WITH_VICON_VEHICLE_TRANSFORM_TOPIC",
-    "center_offset_subject_m": [null, null, null],
+    "center_offset_subject_m": [
+      null,
+      null,
+      null
+    ],
     "radius_m": null
   },
   "map_path": "/REPLACE_WITH_RECORDED_VICON_MAP/map.yaml",
-  "obstacle_topics": {"REPLACE_WITH_EACH_MAP_PILLAR_NAME": "REPLACE_WITH_VICON_TRANSFORM_TOPIC"},
   "topics": {
     "nominal": "commander/set_pose",
     "safe": "commander/set_pose_safe",
@@ -30,9 +33,11 @@
     "nominal_max_age_s": null,
     "velocity_max_gap_s": null,
     "max_subject_skew_s": null,
-    "max_vicon_speed_m_s": null,
-    "max_obstacle_yaw_rate_rad_s": null
+    "max_vicon_speed_m_s": null
   },
-  "collision": {"horizon_s": null, "stop_margin_m": null},
+  "collision": {
+    "horizon_s": null,
+    "stop_margin_m": null
+  },
   "log_path": "/REPLACE_WITH_NEW_SESSION_LOG/collision_stop.jsonl"
 }

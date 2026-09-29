@@ -27,7 +27,7 @@ import numpy as np
 # planar_planner_node map/footprint contract.
 OCC_THRESH = 50
 UNKNOWN_UNSAFE = True
-UNKNOWN_INFLATE = 0.0
+UNKNOWN_INFLATE = 0.31   # r_quad: the airframe never overlaps unobserved space (docs/THREE_ARM_TEST30B_RESULTS_20260928.md 4.2.3)
 FOOTPRINT_EXTRA = 0.05
 
 
@@ -262,7 +262,17 @@ class SupervisorCore(object):
             return False
         st = getattr(self.assembly.hpa, "_commit_state", None)
         commit = int(self.config["hpa"].get("commit", 1))
-        return st is None or st["res"] is None or st["i"] >= commit
+        return st is None or st["res"] is None or st["i"] + 1 >= commit
+
+    def ticks_until_refresh(self):
+        """Ticks until the tick whose HPA call starts a new chunk, bridge ticks first."""
+        from planner.hpa.commit import ticks_until_fresh
+        if self.assembly is None:
+            return 1
+        bridge = getattr(self.assembly.producer, "_bridge", None)
+        return ticks_until_fresh(int(self.config["hpa"].get("commit", 1)),
+                                 getattr(self.assembly.hpa, "_commit_state", None),
+                                 bridge_ticks=0 if bridge is None else int(bridge[1]) + 1)
 
     def tick(self, req):
         from planar_producer_factory import build_producer
@@ -320,6 +330,7 @@ class SupervisorCore(object):
                                                      psi=np.asarray(ref.psi), psi_dot=np.asarray(ref.psi_dot),
                                                      dt=float(ref.dt)),
             next_needs_observation=self.needs_observation(),
+            ticks_until_refresh=self.ticks_until_refresh(),
             look_probe=None if self.look is None else dict(used=self.look.used, discarded=self.look.discarded),
             probe_cache=None if self.cache is None else dict(hits=self.cache.hits, solves=self.cache.solves))
         return reply
@@ -400,11 +411,13 @@ class SupervisorWorker(object):
         self.pid = self.channel.pid
         self.reply_timeout = reply_timeout
         self.next_needs_observation = True
+        self.ticks_until_refresh = 1
 
     def tick(self, req):
         self.channel.conn.send(req)
         reply = self.channel.recv(self.reply_timeout, "reply")["reply"]
         self.next_needs_observation = reply["next_needs_observation"]
+        self.ticks_until_refresh = reply["ticks_until_refresh"]
         return reply
 
     def close(self):

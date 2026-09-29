@@ -105,7 +105,7 @@ def test_stale_nominal_suppressed_and_latched(profile, map_doc):
     {"commander/set_pose_safe": "/rogx2/mavros/setpoint_raw/local"},
     {"commander/set_pose_safe": "/rogx2/commander/set_pose"},
     {"commander/collision_stop_status": "/rogx2/commander/collision_stop_execution"},
-    {"/vicon/wall/wall": "/rogx2/vicon/drone/drone"},
+    {"/vicon/drone/drone": "/rogx2/commander/set_pose_safe"},
 ])
 def test_unsafe_topic_remaps_refused_before_advertising(profile, map_doc, remaps):
     ros = FakeRos(remaps)

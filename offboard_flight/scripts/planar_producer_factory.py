@@ -138,7 +138,7 @@ def _normalize(mode, config):
         if w["d_influence"] is not None:
             w["d_influence"] = _number(w["d_influence"], "haa.weights.d_influence", strictly_positive=True)
         w["R_dnu"] = _vector(w["R_dnu"], "haa.weights.R_dnu")
-        if w["yaw_mode"] not in ("velocity", "goal", "hold"):
+        if w["yaw_mode"] not in ("velocity", "goal", "goal_in_view", "hold"):
             raise ValueError("unknown haa.weights.yaw_mode")
         # These are PlanarMPPI's unchanged constructor defaults. Logging them
         # makes behavior visible even though the existing ROS node omits them.

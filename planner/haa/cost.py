@@ -160,6 +160,12 @@ def first_blocking_class(occ, P, goal, step=None, max_samples=256,
     return sample[np.arange(P.shape[0]), first].astype(np.int64)
 
 
+# Half-angle [rad] of the heading cone inside which yaw_mode 'goal_in_view'
+# costs nothing: the ZED 2i's 84.9 deg horizontal FOV is +-42.4 deg; 40 deg
+# keeps the goal a little inside the image edge.
+GOAL_VIEW_HALF_ANGLE = np.radians(40.0)
+
+
 class FrontierMPPI(PlanarMPPI):
     """PlanarMPPI plus PA-MPPI's frontier term on the terminal node.
 
@@ -292,7 +298,7 @@ class FrontierMPPI(PlanarMPPI):
         if getattr(w, 'w_yaw', 0.0) > 0.0:
             psi = X[..., IPSI]
             mode = getattr(w, 'yaw_mode', 'velocity')
-            if mode == 'goal':
+            if mode in ('goal', 'goal_in_view'):
                 ref = np.arctan2(np.asarray(goal)[1] - P[..., 1],
                                  np.asarray(goal)[0] - P[..., 0])
             else:
@@ -303,6 +309,12 @@ class FrontierMPPI(PlanarMPPI):
                     np.arctan2(np.asarray(goal)[1] - P[..., 1],
                                np.asarray(goal)[0] - P[..., 0]))
             e = np.arctan2(np.sin(psi - ref), np.cos(psi - ref))
+            if mode == 'goal_in_view':
+                # Penalise only a goal OUTSIDE the camera view: no cost while
+                # the goal bearing is within GOAL_VIEW_HALF_ANGLE of the
+                # heading, the excess angle squared beyond it. Keeps the goal
+                # region observed without pinning the heading to it.
+                e = np.maximum(0.0, np.abs(e) - GOAL_VIEW_HALF_ANGLE)
             J += w.w_yaw * np.square(e).sum(axis=1)
 
         if parts.get("frontier") is None:

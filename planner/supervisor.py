@@ -1487,6 +1487,15 @@ class DeSimplexSupervisor(object):
         ref, left, target = self._bridge
         ref = drop_first(ref)
         left = int(left)
+        # The committed HPA plan is a TIME SCHEDULE and a bridge tick uses one
+        # tick of it even though the producer is not consulted. The bridge
+        # lands time-aligned on the destination (planner/transition.py), so the
+        # plan must resume at the node the bridge delivered the vehicle to, not
+        # where it was left when the bridge began (fixed 2026-09-28: it resumed
+        # ~transition_steps nodes behind the vehicle).
+        st = getattr(self.hpa, "_commit_state", None)
+        if st is not None and st.get("res") is not None:
+            st["i"] += 1
         if left > 0 and not bridge_ok(ref, left, self.validator,
                                       self.dyn_full, a_prev=a_prev):
             self._bridge = None

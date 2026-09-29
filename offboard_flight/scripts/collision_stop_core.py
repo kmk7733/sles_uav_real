@@ -52,7 +52,7 @@ def _keys(value, keys, name):
 def validate_profile(profile):
     p = copy.deepcopy(profile)
     _keys(p, ("schema", "enabled", "session_id", "mode", "vicon_frame_id",
-              "vehicle", "map_path", "obstacle_topics", "topics", "nominal",
+              "vehicle", "map_path", "topics", "nominal",
               "limits", "collision", "log_path"), "profile")
     if p["schema"] != 1 or p["enabled"] is not True:
         raise ValueError("profile must explicitly enable schema 1")
@@ -66,14 +66,6 @@ def validate_profile(profile):
     p["vehicle"]["center_offset_subject_m"] = _vector(
         p["vehicle"]["center_offset_subject_m"], 3, "vehicle.center_offset_subject_m")
     p["vehicle"]["radius_m"] = _number(p["vehicle"]["radius_m"], "vehicle.radius_m", positive=True)
-    if not isinstance(p["obstacle_topics"], dict) or not p["obstacle_topics"]:
-        raise ValueError("obstacle_topics must explicitly cover the nonempty map")
-    for name, topic in p["obstacle_topics"].items():
-        _text(name, "obstacle name")
-        _text(topic, "obstacle topic")
-    sensor_topics = list(p["obstacle_topics"].values()) + [p["vehicle"]["topic"]]
-    if len(set(sensor_topics)) != len(sensor_topics):
-        raise ValueError("Vicon subject topics must be distinct")
     _keys(p["topics"], ("nominal", "safe", "status", "execution"), "topics")
     for key, topic in p["topics"].items():
         _text(topic, "topics." + key)
@@ -87,7 +79,7 @@ def validate_profile(profile):
         raise ValueError("nominal.frame_policy must be exact or epoch_tagged")
     limit_names = ("rate_hz", "vicon_max_age_s", "max_future_s", "execution_max_age_s",
                    "nominal_max_age_s", "velocity_max_gap_s", "max_subject_skew_s",
-                   "max_vicon_speed_m_s", "max_obstacle_yaw_rate_rad_s")
+                   "max_vicon_speed_m_s")
     _keys(p["limits"], limit_names, "limits")
     for key in limit_names:
         p["limits"][key] = _number(p["limits"][key], "limits." + key,
@@ -165,7 +157,11 @@ def segment_rect_distance(start, end, center, size, yaw):
 class CollisionStopCore(object):
     """Timestamped Vicon input and independent, terminal stop decision.
 
-    Positions/velocities never come from PX4. Vertical obstacle extents are
+    Positions/velocities never come from PX4. The obstacles are STATIC: their
+    footprints are the map.yaml captured before the flight and are never
+    re-read from Vicon (operator decision 2026-09-28 -- a Vicon orientation
+    glitch on a pillar that does not move stopped a flight). Only the vehicle
+    is a live Vicon input. Vertical obstacle extents are
     deliberately NOT used to waive a stop: all pillars are treated as infinite
     vertical extrusions, a conservative planar contract. Subject histories need
     two increasing header stamps; there is no arrival-time fallback or coast.
@@ -204,17 +200,12 @@ class CollisionStopCore(object):
             if min(size) <= 0:
                 raise ValueError("pillar size must be positive")
             yaw = _number(item.get("yaw"), name + ".yaw", minimum=-float("inf"))
-            body = _vector(item.get("body_position"), 3, name + ".body_position")
-            byaw = _number(item.get("body_yaw"), name + ".body_yaw", minimum=-float("inf"))
-            delta = _rotate((center[0] - body[0], center[1] - body[1]), -byaw)
-            out[name] = {"size": size, "offset": delta, "dyaw": yaw - byaw}
-        if set(out) != set(self.config["obstacle_topics"]):
-            raise ValueError("obstacle_topics must cover EVERY map pillar exactly")
+            out[name] = {"size": size, "center": center, "yaw": yaw}
         return out
 
     def update_vicon(self, name, stamp, frame_id, position, quaternion):
-        if name != "vehicle" and name not in self.obstacles:
-            raise ValueError("unconfigured Vicon subject")
+        if name != "vehicle":
+            raise ValueError("only the vehicle is a Vicon input; obstacles come from the map")
         try:
             stamp = _number(stamp, "Vicon header stamp", positive=True)
             if frame_id != self.config["vicon_frame_id"]:
@@ -224,13 +215,8 @@ class CollisionStopCore(object):
             if prev is not None and stamp <= prev["stamp"]:
                 raise ValueError("timestamp_not_increasing")
             yaw = _yaw(q)
-            if name == "vehicle":
-                delta = _rotate3(self.config["vehicle"]["center_offset_subject_m"], q)
-                center = tuple(position[i] + delta[i] for i in range(3))
-            else:
-                offset = _rotate(self.obstacles[name]["offset"], yaw)
-                center = (position[0] + offset[0], position[1] + offset[1], position[2])
-                yaw += self.obstacles[name]["dyaw"]
+            delta = _rotate3(self.config["vehicle"]["center_offset_subject_m"], q)
+            center = tuple(position[i] + delta[i] for i in range(3))
             velocity, omega = None, None
             if prev is not None:
                 dt = stamp - prev["stamp"]
@@ -239,8 +225,6 @@ class CollisionStopCore(object):
                     omega = math.atan2(math.sin(yaw - prev["yaw"]), math.cos(yaw - prev["yaw"])) / dt
                     if math.hypot(*velocity) > self.limits["max_vicon_speed_m_s"]:
                         raise ValueError("position_jump_or_speed_limit")
-                    if name != "vehicle" and abs(omega) > self.limits["max_obstacle_yaw_rate_rad_s"]:
-                        raise ValueError("obstacle_rotation_jump")
             self.samples[name] = {"stamp": stamp, "center": center, "yaw": yaw,
                                   "velocity": velocity, "omega": omega}
             self.errors.pop(name, None)
@@ -363,7 +347,7 @@ class CollisionStopCore(object):
             if err:
                 errors.append(err)
         ages = {}
-        for name in ["vehicle"] + sorted(self.obstacles):
+        for name in ["vehicle"]:
             item = self.samples.get(name)
             if item is None:
                 gt_errors.append("vicon_%s_missing" % name)
@@ -428,29 +412,20 @@ class CollisionStopCore(object):
         p, v = drone["center"], drone["velocity"]
         horizon = self.config["collision"]["horizon_s"]
         radius = self.config["vehicle"]["radius_m"]
+        drone_age = max(0.0, now - drone["stamp"])
+        # A valid but old vehicle sample must not silently shorten lookahead:
+        # inflate for the motion between its stamp and decision time. Obstacles
+        # are static map footprints (no age, no velocity, no rotation).
+        age_pad = drone_age * math.hypot(*v)
+        end = (p[0] + v[0] * horizon, p[1] + v[1] * horizon)
         result = []
-        for name, base in sorted(self.obstacles.items()):
-            obs = self.samples[name]
-            relative = (v[0] - obs["velocity"][0], v[1] - obs["velocity"][1])
-            end = (p[0] + relative[0] * horizon, p[1] + relative[1] * horizon)
-            # Bound displacement caused by unsynchronised live subjects and
-            # obstacle rotation over the configured lookahead. No PX4 values.
-            skew = abs(drone["stamp"] - obs["stamp"])
-            skew_pad = skew * (math.hypot(*v) + math.hypot(*obs["velocity"]))
-            drone_age, obstacle_age = max(0.0, now - drone["stamp"]), max(0.0, now - obs["stamp"])
-            # A valid but old sample must not silently shorten lookahead.
-            # Inflate for motion between each source stamp and decision time;
-            # stale inputs are still rejected above, never coasted indefinitely.
-            age_pad = drone_age * math.hypot(*v) + obstacle_age * math.hypot(*obs["velocity"])
-            rotation_pad = 0.5 * math.hypot(*base["size"]) * abs(obs["omega"]) * (horizon + obstacle_age)
-            current = point_rect_distance(p, obs["center"], base["size"], obs["yaw"]) - radius - skew_pad - age_pad
-            projected = segment_rect_distance(p, end, obs["center"], base["size"], obs["yaw"]) - radius - skew_pad - age_pad - rotation_pad
+        for name, obs in sorted(self.obstacles.items()):
+            current = point_rect_distance(p, obs["center"], obs["size"], obs["yaw"]) - radius - age_pad
+            projected = segment_rect_distance(p, end, obs["center"], obs["size"], obs["yaw"]) - radius - age_pad
             result.append({"obstacle": name, "margin_m": current,
-                           "projected_margin_m": projected, "skew_padding_m": skew_pad,
-                           "sample_age_padding_m": age_pad,
-                           "rotation_padding_m": rotation_pad, "horizon_s": horizon,
-                           "effective_lookahead_from_oldest_stamp_s": horizon + max(drone_age, obstacle_age),
-                           "vehicle_velocity_vicon_xy": list(v),
-                           "obstacle_velocity_vicon_xy": list(obs["velocity"]),
-                           "vehicle_stamp": drone["stamp"], "obstacle_stamp": obs["stamp"]})
+                           "projected_margin_m": projected, "sample_age_padding_m": age_pad,
+                           "horizon_s": horizon,
+                           "effective_lookahead_from_oldest_stamp_s": horizon + drone_age,
+                           "vehicle_velocity_vicon_xy": list(v), "obstacle_source": "map",
+                           "vehicle_stamp": drone["stamp"]})
         return result

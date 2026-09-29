@@ -7,8 +7,11 @@ order, weighting, the damped update, swept validation and all fallbacks --
 stays in the original NumPy code. Positions, velocities, inputs, validity,
 distances and clearances are computed with the same double-precision operation
 order (nvcc -fmad=false); only the heading wrap (sin/cos/atan2) may differ from
-libm by an ulp. Anything the kernel does not reproduce exactly (other dynamics,
-w_yaw > 0, no occupancy grid) falls back to the NumPy path for that call.
+libm by an ulp. The yaw term (w_yaw > 0) needs no kernel support: it is a
+function of the rolled-out X (heading, position, velocity) and is summed in
+FrontierMPPI._cost_from_parts like every other term. Anything the kernel does
+not reproduce exactly (other dynamics, no occupancy grid) falls back to the
+NumPy path for that call.
 
 Opt-in only: the simulator and existing nodes never enable it.
 """
@@ -66,7 +69,6 @@ class CudaBatch(object):
         dyn = planner.dyn
         return (type(dyn) is CappedDynamics
                 and getattr(dyn.step, "__func__", None) is PlanarDynamics.step
-                and getattr(planner.w, "w_yaw", 0.0) == 0.0
                 and occ is not None and hasattr(occ, "unsafe") and hasattr(occ, "cell_to_world"))
 
     @staticmethod

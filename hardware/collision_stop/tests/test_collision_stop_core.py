@@ -18,14 +18,13 @@ def profile():
         "schema": 1, "enabled": True, "session_id": "offline-test-only", "mode": "shadow",
         "vicon_frame_id": "vicon/world", "map_path": "/fixture/map.yaml", "log_path": "/fixture/test.jsonl",
         "vehicle": {"topic": "/vicon/drone/drone", "center_offset_subject_m": [0, 0, 0], "radius_m": 0.2},
-        "obstacle_topics": {"wall": "/vicon/wall/wall"},
         "topics": {"nominal": "commander/set_pose", "safe": "commander/set_pose_safe",
                    "status": "commander/collision_stop_status", "execution": "commander/collision_stop_execution"},
         "nominal": {"coordinate_frame": 1, "frame_id": "fcu_local", "frame_policy": "epoch_tagged"},
         "limits": {"rate_hz": 20, "vicon_max_age_s": 0.3, "max_future_s": 0.01,
                    "execution_max_age_s": 0.3, "nominal_max_age_s": 0.3,
                    "velocity_max_gap_s": 0.2, "max_subject_skew_s": 0.1,
-                   "max_vicon_speed_m_s": 10, "max_obstacle_yaw_rate_rad_s": 5},
+                   "max_vicon_speed_m_s": 10},
         "collision": {"horizon_s": 0.5, "stop_margin_m": 0.1},
     }
 
@@ -48,7 +47,6 @@ def nominal(stamp=1.0):
 def healthy(core, x=0.0, vx=0.0, state="MISSION"):
     for stamp, pos in ((0.9, x - vx * 0.1), (1.0, x)):
         core.update_vicon("vehicle", stamp, "vicon/world", [pos, 0, 1], [0, 0, 0, 1])
-        core.update_vicon("wall", stamp, "vicon/world", [2, 0, 0], [0, 0, 0, 1])
     core.update_execution(execution(state=state))
     core.update_nominal(nominal())
 
@@ -92,11 +90,10 @@ def test_unsafe_initial_placement_blocks_start_without_fake_failure(profile, map
     assert result["state"] == "STANDBY" and not result["ready"] and not result["failure"]
 
 
-@pytest.mark.parametrize("subject", ["vehicle", "wall"])
-def test_every_vicon_subject_must_be_fresh(profile, map_doc, subject):
+def test_vehicle_vicon_must_be_fresh(profile, map_doc):
     core = CollisionStopCore(profile, map_doc)
     healthy(core)
-    core.samples[subject]["stamp"] = 0.5
+    core.samples["vehicle"]["stamp"] = 0.5
     result = core.evaluate(1.0)
     assert result["state"] == "STOP" and result["cause"] == "input_fault"
     assert "stale" in result["reason"]
@@ -124,15 +121,11 @@ def test_backward_ros_clock_blocks(profile, map_doc):
     assert core.evaluate(0.999)["reason"] == "ros_time_backwards"
 
 
-def test_future_vicon_and_inter_subject_skew_block(profile, map_doc):
+def test_future_vicon_blocks(profile, map_doc):
     core = CollisionStopCore(profile, map_doc)
     healthy(core)
-    core.samples["wall"]["stamp"] = 1.02
+    core.samples["vehicle"]["stamp"] = 1.02
     assert "future_stamp" in core.evaluate(1.0)["reason"]
-    core = CollisionStopCore(profile, map_doc)
-    healthy(core)
-    core.samples["wall"]["stamp"] = 0.89
-    assert core.evaluate(1.0)["reason"] == "vicon_subject_timestamp_skew"
 
 
 def test_velocity_gap_needs_two_new_samples_not_coasting(profile, map_doc):
@@ -143,15 +136,17 @@ def test_velocity_gap_needs_two_new_samples_not_coasting(profile, map_doc):
     assert not result["ready"] and "velocity_unready" in result["reason"]
 
 
-def test_relative_obstacle_velocity_can_trigger_for_stationary_drone(profile, map_doc):
-    profile["collision"]["horizon_s"] = 1.0
+def test_obstacles_are_the_static_map_and_never_a_vicon_input(profile, map_doc):
+    # 2026-09-28: a Vicon orientation glitch on a static pillar stopped a flight.
+    core = CollisionStopCore(profile, map_doc)
+    healthy(core, x=1.0, vx=1.0)
+    result = core.evaluate(1.0)
+    assert result["cause"] == "collision"                     # map wall at x=1.8..2.2, horizon 0.5 s
+    assert result["risks"][0]["obstacle_source"] == "map"
     core = CollisionStopCore(profile, map_doc)
     healthy(core)
-    core.samples["wall"]["center"] = (1.2, 0, 0)
-    core.samples["wall"]["velocity"] = (-1, 0)
-    result = core.evaluate(1.0)
-    assert result["cause"] == "collision"
-    assert result["risks"][0]["obstacle_velocity_vicon_xy"] == [-1, 0]
+    with pytest.raises(ValueError, match="only the vehicle"):
+        core.update_vicon("wall", 1.01, "vicon/world", [5, 6, 0], [0, 0, 1, 0])
 
 
 def test_age_padding_prevents_stale_valid_samples_shortening_horizon(profile, map_doc):
@@ -162,16 +157,6 @@ def test_age_padding_prevents_stale_valid_samples_shortening_horizon(profile, ma
     assert second["sample_age_padding_m"] == pytest.approx(0.1)
     assert second["projected_margin_m"] == pytest.approx(first["projected_margin_m"] - 0.1)
     assert second["effective_lookahead_from_oldest_stamp_s"] == pytest.approx(0.6)
-
-
-def test_rigid_body_offset_rotates_fitted_rectangle(profile, map_doc):
-    # Capture subject (1,0), fitted box (2,0): offset must rotate with subject.
-    map_doc["pillars"][0]["body_position"] = [1, 0, 0]
-    core = CollisionStopCore(profile, map_doc)
-    q = [0, 0, math.sin(math.pi / 4), math.cos(math.pi / 4)]
-    core.update_vicon("wall", 1.0, "vicon/world", [5, 6, 0], q)
-    assert core.samples["wall"]["center"] == pytest.approx((5, 7, 0))
-    assert core.samples["wall"]["yaw"] == pytest.approx(math.pi / 2)
 
 
 @pytest.mark.parametrize("fault", ["missing", "wrong_session", "replay", "restart", "stale"])
@@ -210,7 +195,6 @@ def test_shadow_without_executor_still_logs_vicon_geometry(profile, map_doc):
     core = CollisionStopCore(profile, map_doc)
     for stamp in (0.9, 1.0):
         core.update_vicon("vehicle", stamp, "vicon/world", [1.7, 0, 1], [0, 0, 0, 1])
-        core.update_vicon("wall", stamp, "vicon/world", [2, 0, 0], [0, 0, 0, 1])
     result = core.evaluate(1.0)
     assert result["execution"] is None and result["risks"] and result["would_stop"]
     assert result["state"] == "STANDBY" and not result["ready"]
@@ -269,16 +253,12 @@ def test_epoch_suffix_and_all_nominal_fields_preserved(profile, map_doc):
     assert core.evaluate(1.01)["nominal"] == value
 
 
-@pytest.mark.parametrize("fault", ["empty", "missing_geometry", "missing_capture", "unmapped", "reserved", "not_object"])
+@pytest.mark.parametrize("fault", ["empty", "missing_geometry", "reserved", "not_object"])
 def test_map_fails_closed_no_silent_omission(profile, map_doc, fault):
     if fault == "empty":
         map_doc["pillars"] = []
     elif fault == "missing_geometry":
         del map_doc["pillars"][0]["size"]
-    elif fault == "missing_capture":
-        del map_doc["pillars"][0]["body_position"]
-    elif fault == "unmapped":
-        profile["obstacle_topics"] = {"different": "/vicon/other/other"}
     elif fault == "reserved":
         map_doc["pillars"][0]["name"] = "vehicle"
     else:
@@ -300,7 +280,6 @@ def test_takeoff_ready_needs_healthy_vicon_but_no_nominal(profile, map_doc):
     core = CollisionStopCore(profile, map_doc)
     for stamp in (0.9, 1.0):
         core.update_vicon("vehicle", stamp, "vicon/world", [0, 0, 1], [0, 0, 0, 1])
-        core.update_vicon("wall", stamp, "vicon/world", [2, 0, 0], [0, 0, 0, 1])
     core.update_execution(execution(state="WAIT"))
     result = core.evaluate(1.0)
     assert result["takeoff_ready"] and not result["ready"] and not result["allow_nominal"]

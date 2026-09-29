@@ -454,6 +454,11 @@ def assert_sole_writer_before_init():
         raise RuntimeError("existing mission/raw setpoint writers: " + ", ".join(sorted(conflicts)))
     if "__name" not in remappings:
         sys.argv.append("__name:=guarded_mission_node")
+        # rospy read sys.argv's remappings when it was imported, and
+        # init_node(argv=None) does not re-read them: without this the node
+        # registered as mission_node and read its ~params from the wrong
+        # namespace (found on ROGX 2026-09-28: require_frame_alignment false).
+        rospy.names.reload_mappings(sys.argv)
 
 
 def main():

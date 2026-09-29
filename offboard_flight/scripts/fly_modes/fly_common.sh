@@ -16,7 +16,7 @@
 #   MAP=/home/rogx/traj/<session>/map.yaml   Vicon arena map of TODAY's pillars (required)
 #   GOAL_INDEX=1..20                         goal from fly_modes/fly_goals.json (the list all three
 #                                            methods share: 1..15 planned, 16..20 spares); screened
-#                                            against MAP and /grid_map
+#                                            against the Vicon obstacles in MAP
 #   GOAL_X, GOAL_Y                           or an explicit goal in the Vicon world frame (not both)
 #   MOUNT_CONFIRMED=1                        HPA/DeSimplex: camera mount checked (required)
 #   TAKEOFF_HEIGHT=1.0                       metres above the takeoff point (mission default)
@@ -43,7 +43,7 @@ RECORDER=fly_recorder
 BUNDLE=/home/rogx/hpa_current/deploy/rogx_hpa_v4
 # The three-arm simulator comparison's settings (HPA commit 10, DeSimplex
 # n_look 10 + handover_decel, HAA horizon 60), for HPA and DeSimplex alike.
-SIM_CONFIG=$SCRIPTS/planar_producer_config.sim_test40.json
+SIM_CONFIG=$SCRIPTS/planar_producer_config.test30b_20260928.json
 TAKEOFF_HEIGHT=${TAKEOFF_HEIGHT:-1.0}
 
 _die() { echo "REFUSED: $*"; exit 1; }
@@ -80,11 +80,44 @@ _record_topics() {
 /${NS}/mavros/local_position/pose /${NS}/mavros/local_position/odom /${NS}/mavros/local_position/velocity_local \
 /${NS}/mavros/setpoint_raw/local /${NS}/mavros/setpoint_raw/target_local /${NS}/mavros/imu/data \
 /${NS}/mavros/battery /${NS}/mavros/rc/in /rosout_agg"
+    # No depth images (operator decision 2026-09-28): state, Vicon and commands
+    # are what the flight analysis reads, and recording depth at 15 Hz slowed the
+    # planner's own depth preprocessing in flight.
     case "$MODE" in
         haa) t="$t /${NS}/planar_planner_node/config /${NS}/planar_planner_node/status /${NS}/planar_planner_node/nominal_path" ;;
-        *)   t="$t /${NS}/zed2i/zed_node/depth/depth_registered /${NS}/zed2i/zed_node/depth/camera_info" ;;
     esac
     echo "$t"
+}
+
+_start_planner() {   # z_local -> starts the MODE planner; needs run, GOAL_X/Y
+    local z_local=$1
+    frame=$($HELPER frame --goal-x "$GOAL_X" --goal-y "$GOAL_Y" --z-local "$z_local" --common "$SCRIPTS") \
+        || { echo "$frame"; return 1; }
+    echo "$frame" > "$run/frame.json"
+    read -r z_world gx gy < <(echo "$frame" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["z_world"], *d["goal_local"][:2])')
+    world=$(rosparam get /robot/world_frame)
+    echo "z_local=$z_local (z_world=$z_world); starting $MODE planner"
+    cd "$SCRIPTS" || exit 1
+    case "$MODE" in
+    haa)
+        ROS_NAMESPACE=$NS _spawn planner "$run/planner.log" python3 -u planar_planner_node.py \
+            _dry_run:=false _world_frame:=$world _goal_x:=$GOAL_X _goal_y:=$GOAL_Y _z0:=$z_world \
+            _plan_rate:=10 _horizon:=60 _producer:=haa \
+            _w_yaw:=0.1 _yaw_mode:=goal_in_view _unknown_inflate:=0.31 ;;
+    hpa)
+        _spawn planner "$run/planner.log" python3 -u hpa_planner_node.py --controller-output \
+            --bundle "$BUNDLE" --log "$run/hpa.jsonl" --device cuda --mount-confirmed \
+            --goal-local "$gx" "$gy" "$z_local" --z-local "$z_local" \
+            --depth-frame zed2i_left_camera_optical_frame --observer-node /$RECORDER \
+            --producer-config "$SIM_CONFIG" --summary-file "$run/hpa_summary.json" ;;
+    desimplex)
+        _spawn planner "$run/planner.log" python3 -u desimplex_planner_node.py --controller-output \
+            --bundle "$BUNDLE" --log "$run/desimplex.jsonl" --device cuda --mount-confirmed \
+            --goal-local "$gx" "$gy" "$z_local" --z-local "$z_local" \
+            --depth-frame zed2i_left_camera_optical_frame --observer-node /$RECORDER \
+            --producer-config "$SIM_CONFIG" --snapshot-dir "$run/grids" --haa-backend cuda --supervisor-worker --parallel-probe --probe-cache \
+            --summary-file "$run/desimplex_summary.json" ;;
+    esac
 }
 
 fly_main() {
@@ -132,15 +165,38 @@ start)
     rosparam load "$SCRIPTS/fly_modes/guarded_mission.rogx.yaml" /${NS}/guarded_mission_node
     rosparam set /${NS}/guarded_mission_node/session_id "$session"
     rosparam set /${NS}/guarded_mission_node/takeoff_height "$TAKEOFF_HEIGHT"
-    ROS_NAMESPACE=$NS _spawn mission "$run/mission.log" python3 -u guarded_mission_node.py
-    sleep 3
-    kill -0 "$(cat "$STATE_DIR/mission.pid")" 2>/dev/null || { fly_main stop; _die "guarded mission exited (see $run/mission.log)"; }
+    ROS_NAMESPACE=$NS _spawn mission "$run/mission.log" python3 -u guarded_mission_node.py __name:=guarded_mission_node
+    # READY only once the node is up under its own name and offers ${SRV}/start
+    # (a fixed sleep let a node that died during init through, 2026-09-28).
+    up=0
+    for _ in $(seq 1 30); do
+        kill -0 "$(cat "$STATE_DIR/mission.pid")" 2>/dev/null || break
+        rosservice list 2>/dev/null | grep -qx "${SRV}/start" && { up=1; break; }
+        sleep 1
+    done
+    [ "$up" = 1 ] || { tail -5 "$run/mission.log"; fly_main stop; _die "guarded mission not up (see $run/mission.log)"; }
     if [ "${RECORD:-1}" != 0 ]; then
         _spawn recorder "$run/record.log" rosbag record __name:=$RECORDER -O "$run/flight" --lz4 \
             -e "/vicon/.*" $(_record_topics)
     fi
+    if [ "$MODE" != haa ]; then
+        # Load + warm the model now (~27 s on the Xavier); in controller mode the
+        # planner publishes nothing until the guarded mission reports a settled hover.
+        _start_planner "${TAKEOFF_HEIGHT:-1.0}" \
+            || { fly_main stop; _die "alignment unavailable; planner not preloaded"; }
+        log=$run/$MODE.jsonl
+        echo "loading the $MODE model (about 30 s) ..."
+        for _ in $(seq 1 120); do
+            kill -0 "$(cat "$STATE_DIR/planner.pid")" 2>/dev/null || break
+            grep -q '"planner_waiting_for_hover"' "$log" 2>/dev/null && break
+            sleep 1
+        done
+        grep -q '"planner_waiting_for_hover"' "$log" 2>/dev/null \
+            || { tail -5 "$run/planner.log"; fly_main stop; _die "planner did not finish loading (see $run/planner.log)"; }
+        echo "model loaded; planner waits for the hover"
+    fi
     echo
-    echo "READY ($MODE). Takeoff goes first; the planner is started at hover:"
+    echo "READY ($MODE). Takeoff goes first; the planner commands start at hover:"
     echo "    $0 go"
     ;;
 
@@ -150,38 +206,28 @@ go)
     [ "$(cat "$STATE_DIR/mode")" = "$MODE" ] || _die "active run is $(cat "$STATE_DIR/mode"), not $MODE"
     read -r GOAL_X GOAL_Y < "$STATE_DIR/goal" || _die "no saved goal; run '$0 start' again"
     echo "goal (Vicon world) = ($GOAL_X, $GOAL_Y), fixed at start"
+    if [ "$MODE" != haa ]; then
+        kill -0 "$(cat "$STATE_DIR/planner.pid" 2>/dev/null)" 2>/dev/null \
+            || _die "preloaded planner is not running (see $run/planner.log); stop and start again"
+        grep -q '"planner_waiting_for_hover"' "$run/$MODE.jsonl" 2>/dev/null || _die "planner model not loaded yet"
+        now=$($HELPER frame --goal-x "$GOAL_X" --goal-y "$GOAL_Y" --z-local 1.0 --common "$SCRIPTS") \
+            || { echo "$now"; _die "alignment unavailable"; }
+        e0=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["epoch"])' "$run/frame.json")
+        e1=$(echo "$now" | python3 -c 'import json,sys; print(json.load(sys.stdin)["epoch"])')
+        [ "$e0" = "$e1" ] || _die "alignment epoch changed since start ($e0 -> $e1); stop and start again"
+    fi
     echo "ARMING AND TAKING OFF in 3 seconds -- ctrl-C to abort"
     sleep 3
     rosservice call ${SRV}/start || _die "start service"
     echo "waiting for a settled hover..."
     hover=$($HELPER wait-hover --timeout 90) || { echo "$hover"; _die "no settled hover; planner NOT started"; }
     z_local=$(echo "$hover" | python3 -c 'import json,sys; print(json.load(sys.stdin)["z_want_local"])')
-    frame=$($HELPER frame --goal-x "$GOAL_X" --goal-y "$GOAL_Y" --z-local "$z_local" --common "$SCRIPTS") \
-        || { echo "$frame"; _die "alignment unavailable; planner NOT started (hovering -- use land)"; }
-    echo "$frame" > "$run/frame.json"
-    read -r z_world gx gy < <(echo "$frame" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["z_world"], *d["goal_local"][:2])')
-    world=$(rosparam get /robot/world_frame)
-    echo "hover z_local=$z_local (z_world=$z_world); starting $MODE planner"
-    cd "$SCRIPTS" || exit 1
-    case "$MODE" in
-    haa)
-        ROS_NAMESPACE=$NS _spawn planner "$run/planner.log" python3 -u planar_planner_node.py \
-            _dry_run:=false _world_frame:=$world _goal_x:=$GOAL_X _goal_y:=$GOAL_Y _z0:=$z_world \
-            _plan_rate:=10 _horizon:=60 _producer:=haa ;;
-    hpa)
-        _spawn planner "$run/planner.log" python3 -u hpa_planner_node.py --controller-output \
-            --bundle "$BUNDLE" --log "$run/hpa.jsonl" --device cuda --mount-confirmed \
-            --goal-local "$gx" "$gy" "$z_local" --z-local "$z_local" \
-            --depth-frame zed2i_left_camera_optical_frame --observer-node /$RECORDER \
-            --producer-config "$SIM_CONFIG" --summary-file "$run/hpa_summary.json" ;;
-    desimplex)
-        _spawn planner "$run/planner.log" python3 -u desimplex_planner_node.py --controller-output \
-            --bundle "$BUNDLE" --log "$run/desimplex.jsonl" --device cuda --mount-confirmed \
-            --goal-local "$gx" "$gy" "$z_local" --z-local "$z_local" \
-            --depth-frame zed2i_left_camera_optical_frame --observer-node /$RECORDER \
-            --producer-config "$SIM_CONFIG" --snapshot-dir "$run/grids" --haa-backend cuda --supervisor-worker --parallel-probe --probe-cache \
-            --summary-file "$run/desimplex_summary.json" ;;
-    esac
+    if [ "$MODE" = haa ]; then
+        _start_planner "$z_local" || _die "alignment unavailable; planner NOT started (hovering -- use land)"
+    else
+        kill -0 "$(cat "$STATE_DIR/planner.pid")" 2>/dev/null || _die "planner exited (hovering -- use land)"
+        echo "hover z_local=$z_local; the preloaded $MODE planner starts on this hover"
+    fi
     echo "MISSION starts by itself on the first fresh planner command (HPA/DeSimplex load the model first)."
     echo "    $0 state     $0 land     $0 stop"
     ;;
@@ -189,16 +235,7 @@ go)
 land)   rosservice call ${SRV}/land ;;
 
 state)
-    printf "execution: "; timeout 3 rostopic echo -n1 /${NS}/commander/collision_stop_execution 2>/dev/null \
-        | sed -n 's/^data: //p' | cut -c1-400
-    printf "guard    : "; timeout 3 rostopic echo -n1 /${NS}/commander/collision_stop_status 2>/dev/null \
-        | sed -n 's/^data: //p' | python3 -c 'import json,sys
-try:
-    d=json.loads(json.loads(sys.stdin.read()))
-    print(d["state"], "ready=%s takeoff_ready=%s reason=%s" % (d["ready"], d.get("takeoff_ready"), d["reason"]))
-except Exception as e: print("unavailable", e)'
-    printf "mav      : "; timeout 3 rostopic echo -n1 /${NS}/mavros/state 2>/dev/null | grep -E "^(armed|mode):" | tr '\n' ' '; echo
-    printf "arrived  : "; timeout 3 rostopic echo -n1 /goal_arrive_tf 2>/dev/null | sed -n 's/^data: //p'
+    $HELPER status
     [ -f "$STATE_DIR/run_dir" ] && echo "run      : $(cat "$STATE_DIR/run_dir")"
     ;;
 

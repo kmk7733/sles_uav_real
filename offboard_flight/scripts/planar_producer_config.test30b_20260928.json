@@ -1,0 +1,78 @@
+{
+  "dt": 0.1,
+  "haa": {
+    "horizon": 60,
+    "num_samples": 192,
+    "temperature": 1.0,
+    "seed": 0,
+    "goal_tol": 0.25,
+    "cap_velocity": true,
+    "use_geodesic": true,
+    "w_frontier": 5.0,
+    "c_occupied": 2.0,
+    "c_unknown": -4.0,
+    "limits": {
+      "v_max": 0.31,
+      "a_max": 3.5,
+      "omega_max": 0.48869999999999997,
+      "alpha_max": 3.85,
+      "tilt_max": 0.6108652381980153,
+      "j_max": 5.5
+    },
+    "sigma": [
+      0.2161124707183739,
+      0.2161124707183739,
+      0.34069085303248164
+    ],
+    "weights": {
+      "w_goal": 1.0,
+      "w_term_pos": 10.0,
+      "w_term_vel": 2.0,
+      "w_obs": 20.0,
+      "d_influence": 0.6,
+      "R_dnu": [
+        1.0,
+        1.0,
+        0.2
+      ],
+      "w_yaw": 0.1,
+      "yaw_mode": "goal_in_view"
+    }
+  },
+  "safety": {
+    "r_safe": 0.51,
+    "sweep_step": 0.025
+  },
+  "haa_true_limits": {
+    "v_max": 0.35,
+    "a_max": 3.5,
+    "omega_max": 0.5236,
+    "alpha_max": 3.85,
+    "j_max": 5.5,
+    "tilt_max": 0.6108652381980153
+  },
+  "hpa": {
+    "limits": {
+      "v_max": 0.5,
+      "a_max": 5.0,
+      "omega_max": 0.5236,
+      "alpha_max": 4.0,
+      "j_max": 8.0,
+      "tilt_max": 0.7853981633974483
+    },
+    "goal_tol": 0.25,
+    "commit": 10
+  },
+  "desimplex": {
+    "n_r": 2,
+    "n_m": 3,
+    "probe_seed": 0,
+    "transition_steps": 6,
+    "recovery_margin": 0.0,
+    "warm_haa": false,
+    "n_look": 10,
+    "handover_decel": true,
+    "seed_nominal": false
+  },
+  "label": "test30b profile (2026-09-28): the test40 profile plus HAA yaw_mode goal_in_view, w_yaw 0.1 (docs/THREE_ARM_TEST30B_RESULTS_20260928.md). The unknown margin r_quad 0.31 is not a producer key; it is UNKNOWN_INFLATE in desimplex_core.py / desimplex_planner_node.py and _unknown_inflate for planar_planner_node."
+}

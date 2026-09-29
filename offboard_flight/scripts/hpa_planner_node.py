@@ -122,6 +122,8 @@ class HPAPlannerNode(ReferenceShadow):
         # 10 Hz algorithm tick (simulator plan rate) for hpa.commit > 1.
         self.last_tick_time = None
         self.ticks_done = 0
+        # V4 chunk computed ahead of the tick that starts it (see _tick_once).
+        self.prefetch = None
         super().__init__(args, rospy, bundle, manifest, model_info, log)
         self.bridge_ready_file = args.ready_file
         self.output_requires_depth = False
@@ -139,8 +141,13 @@ class HPAPlannerNode(ReferenceShadow):
 
     last_tick_time = None
     ticks_done = 0
+    prefetch = None
     TICK_S = 0.1          # simulator plan_hz 10: one producer call per 0.1 s of state time
     MAX_TICK_LAG_S = 1.0  # a tick this far behind can no longer be flown: stop the session
+    # L: call V4 this long before the tick that starts its chunk, so the chunk
+    # is ready then (operator decision 2026-09-28; flight p50 0.23 s, p95 0.31 s
+    # from the latest received depth frame to a ready chunk).
+    PREFETCH_LEAD_S = 0.3
 
     @property
     def commit(self):
@@ -174,7 +181,13 @@ class HPAPlannerNode(ReferenceShadow):
         if producer is None:
             return True
         st = getattr(producer, "_commit_state", None)
-        return st is None or st["res"] is None or st["i"] >= self.commit
+        return st is None or st["res"] is None or st["i"] + 1 >= self.commit
+
+    def ticks_until_refresh(self):
+        """Ticks until the tick that starts a new chunk (1 = the next tick)."""
+        from planner.hpa.commit import ticks_until_fresh
+        producer = self.hpa_producer()
+        return ticks_until_fresh(self.commit, getattr(producer, "_commit_state", None))
 
     def producer_goal_tol(self):
         return float(self.assembly.hpa.goal_tol)
@@ -193,7 +206,17 @@ class HPAPlannerNode(ReferenceShadow):
                                fcu_service_clients=0), stream)
         return result
 
+    _emit_lock = None
+
     def emit(self, event, **fields):
+        # The V4 prefetch thread logs too: one writer at a time, whole lines.
+        if self._emit_lock is None:
+            import threading
+            HPAPlannerNode._emit_lock = threading.RLock()
+        with self._emit_lock:
+            self._emit_unlocked(event, **fields)
+
+    def _emit_unlocked(self, event, **fields):
         if event == "session_start":
             fields["safety"] = ("separate nominal reference publisher; CollisionStopGuard and guarded mission required"
                                 if self.args.controller_output else "diagnostic PositionTarget publisher only")
@@ -234,28 +257,131 @@ class HPAPlannerNode(ReferenceShadow):
     def _tick_once(self, consumed):
         """One simulator plan tick per 0.1 s of state time (hpa.commit > 1).
 
-        Refresh ticks (the commit wrapper will ask the policy) run the full V4
-        path on the first depth frame stamped at least 0.1 s after the previous
-        tick, so the policy's observation, state and anchor coincide. Committed
-        ticks run exactly 0.1 s after the previous one on the PX4 state at that
-        time: no new observation, the wrapper serves the committed chunk shifted
-        by the call count -- the simulator's 10 Hz call semantics.
+        Every tick runs on the causal PX4 state at its tick time tau and calls
+        the producer once (simulator 10 Hz call semantics, planner/hpa/commit.py).
+        On the tick that starts a new chunk the policy's chunk must already be
+        there: V4 is called PREFETCH_LEAD_S before that tick on the latest depth
+        frame already received and the PX4 state at that frame's stamp. The tick
+        then integrates the chunk's 10 actions from ITS OWN state and flies them
+        from node 0 -- the whole chunk, nothing skipped; the only difference from
+        the simulator is that the observation is ~L older. A chunk that is late
+        holds its tick until it arrives (MAX_TICK_LAG_S still applies).
         """
-        if self.tick_needs_observation():
-            with self.lock:
-                depth = self.latest_depth
-            if depth is None or depth[0] == consumed:
+        now = self.rospy.Time.now().to_sec()
+        self._maybe_prefetch(now)
+        pf = self.prefetch
+        if self.last_tick_time is None:
+            if pf is None or pf["status"] != "ready":
                 return consumed
-            if self.last_tick_time is not None and depth[0] < self.last_tick_time + self.TICK_S - 1e-6:
-                return consumed      # wait for the first frame at or after the next tick time
-            return super().infer_once(consumed)
-        self._committed_tick(self.last_tick_time + self.TICK_S)
+            tau = pf["ready_stamp"]                 # the first tick starts when the first chunk is ready
+        else:
+            tau = self.last_tick_time + self.TICK_S
+        fresh = self.tick_needs_observation()
+        if fresh:
+            if pf is None or pf["status"] != "ready" or (
+                    pf["target"] is not None and abs(pf["target"] - tau) > 1e-3):
+                if now - tau > getattr(self.args, "max_tick_lag", self.MAX_TICK_LAG_S):
+                    with self.lock:
+                        self.invalidate_locked("V4 chunk for the %.3f tick not ready (%.2f s late)" % (tau, now - tau))
+                    raise RuntimeError(self.fatal)
+                return consumed
+            self.current_chunk = pf["chunk"]
+        if self._committed_tick(tau, pf if fresh else None) and fresh:
+            self.prefetch = None
         return consumed
 
-    def _committed_tick(self, tau):
+    def _refresh_target(self):
+        """State time of the next tick that starts a chunk; None before the first tick."""
+        if self.last_tick_time is None:
+            return None
+        return self.last_tick_time + self.TICK_S * self.ticks_until_refresh()
+
+    def _maybe_prefetch(self, now):
+        target = self._refresh_target()
+        pf = self.prefetch
+        if pf is not None:
+            same = (pf["target"] is None and target is None) or (
+                pf["target"] is not None and target is not None and abs(pf["target"] - target) <= 1e-3)
+            if same or pf["status"] == "running":
+                return                                # one V4 at a time; retarget once it finishes
+            self.emit("v4_chunk_discarded", target=pf["target"], new_target=target, status=pf["status"])
+            self.prefetch = pf = None
+        if target is not None and target - now > self.PREFETCH_LEAD_S + 1e-6:
+            return
+        with self.lock:
+            depth, buffers, state_record, epoch = (self.latest_depth, {k: tuple(v) for k, v in self.buffers.items()},
+                                                   self.state, self.epoch)
+        if depth is None:
+            return
+        pf = self.prefetch = dict(target=target, status="running", trigger_stamp=now, obs_stamp=depth[0])
+        self._launch(lambda: self._run_prefetch(pf, depth, buffers, state_record, epoch))
+
+    def _launch(self, fn):
+        import threading
+        threading.Thread(target=fn, name="v4_prefetch", daemon=True).start()
+
+    def _run_prefetch(self, pf, depth_record, buffers, state_record, epoch):
+        started = time.perf_counter()
+        try:
+            chunk, info = self._infer_chunk(depth_record, buffers, state_record, epoch)
+        except Exception as error:                   # the tick waits; the next loop calls V4 again
+            with self.lock:
+                self.counts["v4_chunk_failed"] += 1
+            self.emit("v4_chunk_failed", target=pf["target"], obs_stamp=depth_record[0], reason=repr(error))
+            if self.prefetch is pf:
+                self.prefetch = None
+            return
+        ready = self.rospy.Time.now().to_sec()
+        pf.update(chunk=chunk, ready_stamp=ready, info=info, status="ready")
+        self.emit("v4_chunk", target=pf["target"], obs_stamp=depth_record[0], trigger_stamp=pf["trigger_stamp"],
+                  ready_stamp=ready, trigger_to_ready_ms=1000 * (ready - pf["trigger_stamp"]),
+                  obs_age_at_trigger_ms=1000 * (pf["trigger_stamp"] - depth_record[0]),
+                  late_ms=None if pf["target"] is None else max(0., 1000 * (ready - pf["target"])),
+                  pipeline_ms=1000 * (time.perf_counter() - started), **info)
+
+    def _infer_chunk(self, depth_record, buffers, state_record, epoch):
+        """V4 on one received depth frame and the PX4 state at its stamp -> (BodyActionChunk, log info)."""
+        from hpa_depth_adapter import align_inputs, InputPending, quantize_scan
+        from shadow_core import camera_intrinsics, decode_depth
+        from planner.hpa import BodyActionChunk
+        stamp, depth_msg, received = depth_record
+        now = self.rospy.Time.now().to_sec()
+        check_age(stamp, now, self.args.max_age, self.args.future_tolerance)
+        if state_record is None or not state_record[1].connected:
+            raise Rejected("FCU disconnected")
+        try:
+            aligned = align_inputs(stamp, buffers, policy=self.args.pose_policy, pose_wait_s=0.0,
+                                   waited_s=time.monotonic() - received, depth_received=received,
+                                   max_gap=self.args.sensor_max_gap, camera_max_gap=self.args.camera_max_gap)
+        except InputPending:
+            raise Rejected("no PX4 pose after the latest depth frame yet")
+        t0 = time.perf_counter()
+        depth = decode_depth(depth_msg)
+        k = camera_intrinsics(aligned["records"]["camera_info"][1], depth_msg, self.args.depth_frame)
+        p, q, rpy = aligned["position"], aligned["quaternion"], aligned["rpy"]
+        v, w = aligned["velocity"], aligned["angular"]
+        raw_scan = self.runtime.make_scan(depth, rpy[:2], k)
+        self.depth_scan_validated(stamp, True)
+        scan, _ = quantize_scan(raw_scan, self.args.scan_precision)
+        encoded = self.runtime.encode_px4_state(p, q, v, w, self.goal)
+        t1 = time.perf_counter()
+        actions = self.runtime.infer(scan, encoded)
+        t2 = time.perf_counter()
+        if actions.shape != (10, 3) or not np.isfinite(actions).all():
+            raise Rejected("nonfinite or invalid output chunk")
+        with self.lock:
+            if self.fatal or epoch != self.epoch:
+                raise Rejected(self.fatal or "estimator epoch changed during V4")
+        # Body actions are rotated by the yaw the policy observed.
+        return BodyActionChunk(actions, float(rpy[2])), dict(
+            preprocess_ms=1000 * (t1 - t0), model_ms=1000 * (t2 - t1), obs_position_enu=p.tolist(),
+            obs_velocity_enu=v.tolist(), obs_rpy_rad=rpy.tolist(), actions=actions.tolist())
+
+    def _committed_tick(self, tau, chunk_info=None):
+        """One producer call on the causal PX4 state at tau. -> True when the tick ran."""
         now = self.rospy.Time.now().to_sec()
         if now < tau:
-            return
+            return False
         if now - tau > getattr(self.args, "max_tick_lag", self.MAX_TICK_LAG_S):
             with self.lock:
                 self.invalidate_locked("planner cannot keep the 10 Hz tick (%.2f s behind)" % (now - tau))
@@ -268,7 +394,7 @@ class HPAPlannerNode(ReferenceShadow):
         # Causal PX4 state at tau (no network input here): wait until a pose
         # stamped after tau has arrived so no older sample is still in flight.
         if not any(r[0] >= tau for r in poses) and now - tau < self.args.sensor_max_gap + self.TICK_S:
-            return
+            return False
         started = time.perf_counter()
         try:
             if state_record is None or not state_record[1].connected:
@@ -304,7 +430,8 @@ class HPAPlannerNode(ReferenceShadow):
                     accepted, discard_reason = False, str(error) + " at completion"
                     self.reject(discard_reason)
             fields = dict(accepted=accepted, discard_reason=discard_reason, anchor_stamp=tau,
-                          estimator_epoch=epoch, tick_kind="committed", planner=planner_log,
+                          estimator_epoch=epoch, tick_kind="fresh" if chunk_info is not None else "committed",
+                          planner=planner_log,
                           goal_local_enu=self.goal.tolist(), position_enu=p.tolist(), rpy_rad=rpy.tolist(),
                           velocity_enu=v.tolist(), angular_body_flu=w.tolist(),
                           input_stamps=dict(pose=odom[0], velocity=velocity[0]),
@@ -318,9 +445,14 @@ class HPAPlannerNode(ReferenceShadow):
                     frame="PX4 local ENU", anchor_stamp=tau, node_dt_s=float(ref.dt), p=ref.p.tolist(),
                     v=ref.v.tolist(), a=ref.a.tolist(), psi=ref.psi.tolist(), psi_dot=ref.psi_dot.tolist(),
                     a_prev_source=a_prev_source, a_prev_used=np.asarray(a_prev).tolist(), status=str(result.status))
+            if chunk_info is not None:
+                fields["chunk"] = dict(obs_stamp=chunk_info["obs_stamp"], trigger_stamp=chunk_info["trigger_stamp"],
+                                       ready_stamp=chunk_info["ready_stamp"], obs_age_at_tick_s=tau - chunk_info["obs_stamp"],
+                                       anchor_yaw_local=float(self.current_chunk.anchor_yaw))
             self.emit("prediction", **fields)
-            self.counts["committed_ticks"] += 1
+            self.counts["fresh_ticks" if chunk_info is not None else "committed_ticks"] += 1
             self.counts["accepted" if accepted else "discarded_after_inference"] += 1
+        return True
 
     def depth_scan_validated(self, anchor_stamp, valid):
         # An inference already in flight at arrival is unused; its late
@@ -433,6 +565,40 @@ class HPAPlannerNode(ReferenceShadow):
                 self.invalidate_locked("controller reference serialization: " + str(error))
 
 
+EXECUTION_TOPIC = "/rogx2/commander/collision_stop_execution"
+
+
+def wait_for_hover(node, rospy, args):
+    """Block until the guarded mission reports a settled hover; take its altitude.
+
+    The model is loaded and warmed before takeoff; nothing is subscribed or
+    published until here, so the planner still starts at hover. A mission that
+    stops, lands or is taken over before hovering ends the session.
+    """
+    import json as _json
+    from std_msgs.msg import String
+    node.emit("planner_waiting_for_hover", execution_topic=EXECUTION_TOPIC)
+    while not rospy.is_shutdown():
+        try:
+            msg = rospy.wait_for_message(EXECUTION_TOPIC, String, timeout=1.0)
+        except rospy.ROSException:
+            continue
+        doc = _json.loads(msg.data)
+        if doc.get("phase") not in (None, "IDLE") or doc.get("state") in ("DONE", "PILOT", "LAND", "DISARM"):
+            raise RuntimeError("mission ended before hover: state=%s phase=%s reason=%s"
+                               % (doc.get("state"), doc.get("phase"), doc.get("reason")))
+        if doc.get("hover_settled") and doc.get("z_want_local") is not None:
+            z = float(doc["z_want_local"])
+            if not math.isfinite(z):
+                raise RuntimeError("non-finite hover altitude")
+            args.z_local = z
+            if node.goal is not None:
+                node.goal[2] = z
+            node.emit("planner_released_at_hover", z_local=z, mission_state=doc.get("state"))
+            return z
+    raise RuntimeError("ROS shutdown while waiting for hover")
+
+
 def main(argv=None, node_class=HPAPlannerNode, node_name="hpa_planner_node", make_parser=parser,
          check_args=validate_args):
     import rosgraph
@@ -469,6 +635,10 @@ def main(argv=None, node_class=HPAPlannerNode, node_name="hpa_planner_node", mak
     with args.log.open("x", buffering=1) as log:
         node = node_class(args, rospy, bundle, manifest, model_info, log, Controller())
         node.emit("model_warmup", **warmup_runtime(node.runtime))
+        if args.controller_output:
+            # Controller mode is started before takeoff so the model is loaded
+            # and warm; it commands nothing until the hover (takeoff goes first).
+            wait_for_hover(node, rospy, args)
         check_output_graph(master.getSystemState(), args.output_topic, args.controller_output, args.guard_node,
                            observer_nodes=args.observer_node)
         check_arrived_graph(master.getSystemState(), args.arrived_topic)

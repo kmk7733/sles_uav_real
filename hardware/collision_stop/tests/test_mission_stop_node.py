@@ -289,7 +289,6 @@ def test_actual_guard_executor_protocol_roundtrip_all_phases(wrapper):
         core = helpers.CollisionStopCore(profile, map_doc)
         for t, px in ((99.9, x - vx * .1), (100., x)):
             assert core.update_vicon("vehicle", t, "vicon/world", [px, 0, 1], [0, 0, 0, 1])
-            assert core.update_vicon("wall", t, "vicon/world", [2, 0, 0], [0, 0, 0, 1])
         core.update_nominal(helpers.nominal(100.))
         return core
     core = core_at()

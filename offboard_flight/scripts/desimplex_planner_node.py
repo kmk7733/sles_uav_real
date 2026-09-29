@@ -31,11 +31,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 from hpa_planner_node import HPAPlannerNode, main as hpa_main, parser as hpa_parser, validate_args as hpa_validate
 from shadow_core import Rejected
 
-# planar_planner_node map/footprint contract (unknown unsafe, no unknown inflation,
-# occupancy threshold 50, footprint cleared by r_safe + 0.05 before each solve).
+# planar_planner_node map/footprint contract (unknown unsafe, occupancy threshold 50,
+# footprint cleared by r_safe + 0.05 before each solve), with the unknown boundary
+# inflated by r_quad 0.31 (docs/THREE_ARM_TEST30B_RESULTS_20260928.md 4.2.3).
 OCC_THRESH = 50
 UNKNOWN_UNSAFE = True
-UNKNOWN_INFLATE = 0.0
+UNKNOWN_INFLATE = 0.31
 FOOTPRINT_EXTRA = 0.05
 
 
@@ -114,6 +115,17 @@ class DeSimplexPlannerNode(HPAPlannerNode):
 
     def hpa_producer(self):
         return None if self.assembly is None else self.assembly.hpa
+
+    def ticks_until_refresh(self):
+        """As HPAPlannerNode, counting the bridge ticks that consume the committed plan first."""
+        if self.worker is not None:      # computed by the worker after its last tick
+            return self.worker.ticks_until_refresh
+        from planner.hpa.commit import ticks_until_fresh
+        if self.assembly is None:
+            return 1
+        bridge = getattr(self.assembly.producer, "_bridge", None)
+        return ticks_until_fresh(self.commit, getattr(self.assembly.hpa, "_commit_state", None),
+                                 bridge_ticks=0 if bridge is None else int(bridge[1]) + 1)
 
     def tick_needs_observation(self):
         if self.worker is not None:      # computed by the worker after its last tick
@@ -240,9 +252,12 @@ class DeSimplexPlannerNode(HPAPlannerNode):
         # The chunk's anchor_yaw is the PLANNING-frame yaw its body actions are
         # rotated by (planner.hpa.reference.world_actions): world here.
         chunk = self.current_chunk
+        # Body actions are rotated by the yaw the policy OBSERVED (the chunk is
+        # computed ahead of the tick that starts it), expressed in the world frame.
+        chunk_yaw_w = math.atan2(math.sin(chunk.anchor_yaw + yaw_offset), math.cos(chunk.anchor_yaw + yaw_offset))
         if self.worker is not None:
-            return self._worker_tick(xi_w, a_prev_w, stamp, grid, chunk, rot, yaw_offset, translation)
-        self.planning_chunk = BodyActionChunk(chunk.actions, float(xi_w[4]))
+            return self._worker_tick(xi_w, a_prev_w, stamp, grid, chunk, rot, yaw_offset, translation, chunk_yaw_w)
+        self.planning_chunk = BodyActionChunk(chunk.actions, chunk_yaw_w)
         occ = grid["occ"]
         occ.clear_disc(p_w[0], p_w[1], self.r_safe + FOOTPRINT_EXTRA)
         if self.assembly is None:
@@ -267,7 +282,7 @@ class DeSimplexPlannerNode(HPAPlannerNode):
                 self.emit("desimplex_tick", anchor_stamp=stamp, tick=self.ticks, grid_seq=grid["seq"],
                           grid_file=self._save_grid(grid), xi_world=xi_w.tolist(),
                           goal_world=self.goal_world.tolist(), a_prev_world=a_prev_w.tolist(),
-                          chunk_actions=_array(chunk.actions), chunk_anchor_yaw_world=float(xi_w[4]),
+                          chunk_actions=_array(chunk.actions), chunk_anchor_yaw_world=chunk_yaw_w,
                           exception=repr(error))
                 self.invalidate_locked("DeSimplex supervisor exception: %r" % (error,))
             raise RuntimeError("DeSimplex supervisor exception") from error
@@ -282,7 +297,7 @@ class DeSimplexPlannerNode(HPAPlannerNode):
                    xi_world=xi_w.tolist(), goal_world=self.goal_world.tolist(), a_prev_world=a_prev_w.tolist(),
                    alignment=dict(epoch=grid["epoch"], yaw=yaw_offset, translation=translation.tolist()),
                    chunk_actions=_array(getattr(chunk, "actions", None)),
-                   chunk_anchor_yaw_local=chunk.anchor_yaw, chunk_anchor_yaw_world=float(xi_w[4]),
+                   chunk_anchor_yaw_local=chunk.anchor_yaw, chunk_anchor_yaw_world=chunk_yaw_w,
                    status=str(result.status), result_reason=result.reason,
                    mode=getattr(d, "mode", None), source=getattr(d, "source", None),
                    decision_reason=getattr(d, "reason", None), fault=bool(getattr(d, "fault", False)),
@@ -305,12 +320,12 @@ class DeSimplexPlannerNode(HPAPlannerNode):
         return MPPIResult(result.status, local, result.U, result.X, result.cost, result.n_valid,
                           result.n_samples, result.beta, result.reason), brief
 
-    def _worker_tick(self, xi_w, a_prev_w, stamp, grid, chunk, rot, yaw_offset, translation):
+    def _worker_tick(self, xi_w, a_prev_w, stamp, grid, chunk, rot, yaw_offset, translation, chunk_yaw_w):
         """_plan_tick's supervisor part in the worker: same request, same log record."""
         from planner.types import MPPIResult
         m = grid["msg"]
         req = dict(grid_seq=grid["seq"], xi_world=xi_w, goal_world=self.goal_world, a_prev_world=a_prev_w,
-                   chunk_actions=np.asarray(chunk.actions, dtype=float), chunk_anchor_yaw_world=float(xi_w[4]),
+                   chunk_actions=np.asarray(chunk.actions, dtype=float), chunk_anchor_yaw_world=chunk_yaw_w,
                    grid=None if self.worker_grid_seq == grid["seq"] else
                    dict(m, seq=grid["seq"], epoch=grid["epoch"], stamp=grid["stamp"]))
         self.ticks += 1
@@ -322,7 +337,7 @@ class DeSimplexPlannerNode(HPAPlannerNode):
                 self.emit("desimplex_tick", anchor_stamp=stamp, tick=self.ticks, grid_seq=grid["seq"],
                           grid_file=None, xi_world=xi_w.tolist(),
                           goal_world=self.goal_world.tolist(), a_prev_world=a_prev_w.tolist(),
-                          chunk_actions=_array(chunk.actions), chunk_anchor_yaw_world=float(xi_w[4]),
+                          chunk_actions=_array(chunk.actions), chunk_anchor_yaw_world=chunk_yaw_w,
                           exception=repr(error))
                 self.invalidate_locked("DeSimplex supervisor exception: %r" % (error,))
             raise RuntimeError("DeSimplex supervisor exception") from error
@@ -343,7 +358,7 @@ class DeSimplexPlannerNode(HPAPlannerNode):
                    xi_world=xi_w.tolist(), goal_world=self.goal_world.tolist(), a_prev_world=a_prev_w.tolist(),
                    alignment=dict(epoch=grid["epoch"], yaw=yaw_offset, translation=translation.tolist()),
                    chunk_actions=_array(chunk.actions),
-                   chunk_anchor_yaw_local=chunk.anchor_yaw, chunk_anchor_yaw_world=float(xi_w[4]),
+                   chunk_anchor_yaw_local=chunk.anchor_yaw, chunk_anchor_yaw_world=chunk_yaw_w,
                    status=r["status"], result_reason=r["result_reason"],
                    mode=r["mode"], source=r["source"], decision_reason=r["decision_reason"], fault=r["fault"],
                    switched=r["switched"], bridge_active=r["bridge_active"],
